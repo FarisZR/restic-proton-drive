@@ -1,7 +1,6 @@
 services:
   drive:
-    build: .
-    image: restic-proton-drive:local
+    image: ghcr.io/fariszr/restic-proton-drive:latest
     init: true
     restart: unless-stopped
     ports:

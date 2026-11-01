@@ -13,23 +13,23 @@ RESTIC_BIN=/path/to/restic bun run stress
 
 The automated stress test uses the production HTTP handler and DriveStore with a fault-injectable implementation of the SDK boundary. It runs a real restic client through a socket-dropping, throttled HTTP proxy. It does not require a Proton account. All its repositories and fixtures are temporary. It retains logs and artifacts under the path printed at the end.
 
-The 18 unit/integration tests cover:
+The 19 unit/integration tests cover:
 
 - HTTP v1/v2, authentication, exact lengths, range boundaries, zero-length objects and unknown REST versions.
 - Truncated/slow incoming bodies, canceled outgoing streams, saturated admission queues, an expired transfer deadline and unavailable spool storage. Healthy requests must work afterward.
 - Upload failures, lost commit acknowledgments, duplicate writes and immutable config. Newly uploaded objects must pass a verified read-back before acknowledgment.
 - Truncated downloads, corrupt bytes, invalid signatures, broken listing pages and undecryptable entries. Failed reads cannot emit a successful partial body or range.
 - Newer/malformed required SDK versions and unsupported feature masks, including masks larger than 32 bits.
-- Fifty concurrent atomic session saves, mode-0600 persistence, reload and rejection of malformed credentials; concurrent expired-token requests trigger one account-SDK refresh.
+- Fifty concurrent atomic session saves, mode-0600 persistence, survival of a failed session-file write, reload and rejection of malformed credentials; concurrent expired-token requests trigger one account-SDK refresh and persist the new access and refresh tokens to disk.
 - Crash recovery after trash, before permanent deletion, and after a lost permanent-deletion acknowledgment. A fresh provider/store reconstructs state from disk, retries are idempotent, and an unrelated node survives.
 - Sixty-four cycles of mixed writes, ranges and deletes with injected lost acknowledgments.
 
-The real-restic stress test has been run four times with independently generated random data. The final expanded run covers:
+The real-restic stress test has been run five times with independently generated random data. The final expanded run covers:
 
 | Scenario | Required result | Observed |
 | --- | --- | --- |
 | 1,011 files, 88 MiB logical source including 24 MiB random data | Backup and cold-cache restore match SHA-256, modes, names and link targets | Pass |
-| Slow transfers, two mid-upload socket drops, SDK 503s and lost commit acknowledgments | Incremental backup completes through restic retries | Pass |
+| Throttled uploads (~6 MiB/s), slow SDK transfers, two mid-upload socket drops, SDK 503s and lost commit acknowledgments | Incremental backup completes through restic retries | Pass |
 | Download drops and failed listing pages | Full data check and latest/historical restores succeed after retries | Pass |
 | SIGKILL/restart of the test server | Persisted repository remains readable and restorable | Pass |
 | Retention and prune | Full check and restore of retained snapshot succeed | Pass |
@@ -45,9 +45,9 @@ Fixtures include empty files/directories, all byte values, sparse data, hardlink
 
 The amd64 image signed into the disposable test account, created a dedicated repository, backed up 157-file fixtures with 12/24 MiB random data and a 32 MiB sparse file, and restored both original and changed snapshots. During backup, the test paused the container for three seconds, disconnected its Docker network for five seconds, then sent SIGKILL and restarted it. Restic retries must complete, followed by full-content checks, cold-cache manifest comparisons, pruning and another restore.
 
-The initial live fault sequence found an upstream PID-lock problem when Docker reused a PID after SIGKILL. The container now holds a kernel `flock` for the server lifetime and replaces the SDK event PID lock only while holding that lock. The first live sequence recovered after the corrected image was started and passed all subsequent checks/restores. The entire sequence is rerun from the corrected image as a separate validation.
+The initial live fault sequence found an upstream PID-lock problem when Docker reused a PID after SIGKILL. The container now holds a kernel `flock` for the server lifetime and replaces the SDK event PID lock only while holding that lock. The first live sequence recovered after the corrected image was started and passed all subsequent checks/restores. A second complete live sequence then passed independently from the corrected image, including backup recovery, full checks, both snapshot restores, pruning and post-prune restoration.
 
-Both architecture images build and execute; neither contains restic. The arm64 container has also created a live Proton repository, backed up three files (1 MiB logical), passed a full data check, and restored and compared those files under QEMU.
+The final local OCI manifest contains both linux/amd64 and linux/arm64. Compose startup with `--wait`, its healthcheck, restart/session reuse and refusal of a concurrent container were also verified. Both architecture images build and execute; neither contains restic. The arm64 container has also created a live Proton repository, backed up three files (1 MiB logical), passed a full data check, and restored and compared those files under QEMU.
 
 Run the live fault sequence only against a dedicated disposable repository/container:
 

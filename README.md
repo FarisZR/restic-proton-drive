@@ -5,9 +5,9 @@ Store a restic repository in Proton Drive. The Docker image runs the REST server
 ## Start
 
 ```sh
-git clone --recurse-submodules https://github.com/FarisZR/restic-proton-drive.git
-cd restic-proton-drive
-docker compose build
+mkdir restic-proton-drive && cd restic-proton-drive
+curl -fsSLO https://raw.githubusercontent.com/FarisZR/restic-proton-drive/main/compose.yaml
+docker compose pull
 docker compose run --rm drive login
 docker compose run --rm drive create backups
 docker compose up -d --wait
@@ -38,13 +38,13 @@ Use restic's default pack size. The server accepts objects up to 64 MiB and uses
 ## Update and maintain
 
 ```sh
-git pull --recurse-submodules
-docker compose up -d --build --wait
+docker compose pull
+docker compose up -d --wait
 # Choose retention to suit your backups:
 restic forget --keep-daily 7 --keep-weekly 4 --prune
 restic check --read-data
 ```
 
-Every push builds amd64/arm64 images at `ghcr.io/fariszr/restic-proton-drive`, tagged by branch and commit; `latest` follows the default branch. You can replace `build: .` in Compose with that image.
+Every push builds amd64/arm64 images at `ghcr.io/fariszr/restic-proton-drive`, tagged by branch and commit; `latest` follows the default branch. For a fixed deployment, pin the image to a commit tag or digest.
 
 [Recovery and configuration](docs/operations.md) · [Design and project context](docs/design.md) · [Tests and reliability limits](docs/testing.md)

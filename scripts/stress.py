@@ -85,7 +85,18 @@ class Proxy(http.server.BaseHTTPRequestHandler):
                 connection.sock.shutdown(socket.SHUT_RDWR)
                 self.connection.shutdown(socket.SHUT_RDWR)
                 return
-            connection.request(self.command, self.path, body, dict(self.headers))
+            if self.command == 'POST' and is_pack and proxy_faults.get('slow'):
+                connection.putrequest(self.command, self.path)
+                for key, value in self.headers.items():
+                    if key.lower() not in ('host', 'connection'):
+                        connection.putheader(key, value)
+                connection.endheaders()
+                for offset in range(0, len(body), 65536):
+                    connection.send(body[offset:offset + 65536])
+                    counts['slow_upload_chunks'] = counts.get('slow_upload_chunks', 0) + 1
+                    time.sleep(0.01)
+            else:
+                connection.request(self.command, self.path, body, dict(self.headers))
             response = connection.getresponse()
             payload = response.read()
             self.send_response(response.status)
@@ -215,6 +226,7 @@ try:
     second = snapshots[-1]['id']
     assert second != first
     assert counts.get('upload_drop') == 2
+    assert counts.get('slow_upload_chunks', 0) > 100
     print('PASS: incremental backup through slow transfers, two mid-body socket drops, transient SDK 503s and lost commit acknowledgments', flush=True)
 
     control(download=2, listing=1, delay=1)

@@ -2,7 +2,18 @@
 
 ## Image and configuration
 
-The image contains only Bun and the bundled REST server, including its login and folder-creation commands. It runs as UID 1000. Restic is a separate client. The supported Linux platforms are amd64 and arm64; Bun does not support 32-bit ARM.
+The image contains only Bun and the bundled REST server, including its login and folder-creation commands. It runs as UID 1000. Restic is a separate client. Compose pulls the published GHCR image. To build from source instead:
+
+```sh
+git clone --recurse-submodules https://github.com/FarisZR/restic-proton-drive.git
+cd restic-proton-drive
+docker build -t ghcr.io/fariszr/restic-proton-drive:latest .
+docker compose run --rm --pull never drive login
+docker compose run --rm --pull never drive create backups
+docker compose up -d --pull never --wait
+```
+
+The supported Linux platforms are amd64 and arm64; Bun does not support 32-bit ARM.
 
 Compose uses a private named volume and publishes port 8000 on host loopback. Inside the container the listener binds to all interfaces so Docker networking can reach it. Do not expose the unencrypted HTTP port over the public internet. Use an SSH tunnel or authenticated TLS termination for remote clients.
 

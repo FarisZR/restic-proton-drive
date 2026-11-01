@@ -1,8 +1,8 @@
 import { expect, test } from 'bun:test';
-import { mkdtemp, rm, stat } from 'node:fs/promises';
+import { mkdtemp, rm, stat, chmod } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { EventEmitter } from 'node:events';
+import { Credentials } from '../sdk/cli/src/credentials/credentials';
 import { ApiClient } from 'proton-drive-sdk-account';
 import { assertRequirements, FileSessionStore } from '../src/session';
 
@@ -39,12 +39,32 @@ test('expired access token refreshes once under concurrent requests and persists
             ? Response.json({ Code: 1000 }) : Response.json({ Code: 401 }, { status: 401 });
     } });
     const logger = { debug() {}, info() {}, warn() {}, error() {} };
-    const credentials = Object.assign(new EventEmitter(), { uid: 'uid', accessToken: 'old', refreshToken: 'refresh',
-        async setSessionInfo(this: any, info: any) { Object.assign(this, info); this.emit('sessionInfoChanged'); } });
+    const dir = await mkdtemp(join(tmpdir(), 'drive-refresh-'));
+    const path = join(dir, 'session');
+    const credentials = new Credentials(new FileSessionStore(path), logger);
+    await credentials.setSessionInfo({ uid: 'uid', accessToken: 'old', refreshToken: 'refresh' });
+    await credentials.setUserKeyPassword('test-key-password');
     try {
-        const client = new ApiClient({ baseUrl: String(server.url), appVersion: 'external-drive-test@0.1.0', credentials: credentials as any, logger });
+        const client = new ApiClient({ baseUrl: String(server.url), appVersion: 'external-drive-test@0.1.0', credentials, logger });
         const responses = await Promise.all(Array.from({ length: 12 }, () => client.authenticatedRequest(String(server.url))));
         expect(responses.every(r => r.ok)).toBe(true);
         expect(refreshed).toBe(1); expect(credentials.refreshToken).toBe('refresh-new');
-    } finally { server.stop(true); }
+        expect((await new FileSessionStore(path).load())?.session.accessToken).toBe('new');
+        expect((await new FileSessionStore(path).load())?.session.refreshToken).toBe('refresh-new');
+    } finally { server.stop(true); await rm(dir, { recursive: true, force: true }); }
+});
+
+
+test('session persistence failure preserves the previous on-disk credentials', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'drive-store-failure-')); const path = join(dir, 'session');
+    const store = new FileSessionStore(path);
+    try {
+        await store.save({ userKeyPassword: 'key', session: { uid: 'uid', accessToken: 'old' } });
+        await chmod(dir, 0o500);
+        await expect(store.save({ userKeyPassword: 'key', session: { uid: 'uid', accessToken: 'new' } })).rejects.toThrow();
+        expect((await store.load())?.session.accessToken).toBe('old');
+        await chmod(dir, 0o700);
+        await store.save({ userKeyPassword: 'key', session: { uid: 'uid', accessToken: 'new' } });
+        expect((await store.load())?.session.accessToken).toBe('new');
+    } finally { await chmod(dir, 0o700); await rm(dir, { recursive: true, force: true }); }
 });
