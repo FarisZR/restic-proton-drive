@@ -99,7 +99,7 @@ test('slow/truncated uploads, oversize declarations and connection loss release 
     } finally { await f.close(); }
 });
 
-test('queue saturation recovers after stalled clients disconnect', async () => {
+test('health bypasses saturated transfers, which recover after stalled clients disconnect', async () => {
     const f = await fixture();
     const sockets: ReturnType<typeof connect>[] = [];
     try {
@@ -110,7 +110,8 @@ test('queue saturation recovers after stalled clients disconnect', async () => {
             socket.write(`POST /data/${'0'.repeat(64)} HTTP/1.1\r\nHost: localhost\r\nAuthorization: ${authorization}\r\nContent-Length: 100\r\n\r\nx`);
         }
         await Bun.sleep(50);
-        expect((await f.request('/health')).status).toBe(503);
+        expect((await f.request('/health')).status).toBe(200);
+        expect((await f.request('/data/')).status).toBe(503);
         sockets.forEach(s => s.destroy());
         await Bun.sleep(50);
         expect((await f.request('/health')).status).toBe(200);

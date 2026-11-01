@@ -10,7 +10,7 @@ FROM oven/bun:1.4.4-slim
 COPY --from=build /out/ /app/
 COPY --chmod=755 docker/entrypoint.sh /app/entrypoint.sh
 RUN mkdir /state && chown bun:bun /state && chmod 700 /state
-ENV PROTON_DRIVE_CACHE_DIR=/state PROTON_DRIVE_CREDENTIALS_STORE=unsafe_file HOST=0.0.0.0
+ENV PROTON_DRIVE_CACHE_DIR=/state PROTON_DRIVE_CREDENTIALS_STORE=unsafe_file HOST=0.0.0.0 SESSION_KEY_FILE=/run/secrets/session-key
 USER bun
 VOLUME /state
 EXPOSE 8000

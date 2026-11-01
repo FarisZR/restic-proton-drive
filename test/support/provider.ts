@@ -21,7 +21,7 @@ export class Provider {
     private node(uid: string, name: string, type = 'file', parentUid?: string, length = 0) {
         return this.nodes[uid] = { uid, parentUid, name: { ok: true, value: name }, type,
             keyAuthor: { ok: true, value: 'test' }, nameAuthor: { ok: true, value: 'test' },
-            activeRevision: type === 'file' ? { claimedSize: length, contentAuthor: { ok: true, value: 'test' } } : undefined } as NodeEntity;
+            activeRevision: type === 'file' ? { uid, claimedSize: length, contentAuthor: { ok: true, value: 'test' } } : undefined } as NodeEntity;
     }
     private save() { return atomicWrite(join(this.dir, 'nodes.json'), JSON.stringify(this.nodes)); }
     private hit(key: keyof Faults) {
@@ -41,6 +41,7 @@ export class Provider {
     }
     async *iterateNodes(ids: string[]) { for (const uid of ids) yield this.nodes[uid] ? await this.getNode(uid) : { missingUid: uid }; }
     async *iterateFolderChildren(parentUid: string) {
+        this.calls.scans = (this.calls.scans || 0) + 1;
         for (const node of Object.values(this.nodes).filter(n => n.parentUid === parentUid && !n.trashTime)) {
             if (this.hit('listing')) throw new Error('503: interrupted listing page');
             const value = structuredClone(node);

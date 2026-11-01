@@ -2,6 +2,20 @@
 
 Tests run on Linux x86-64 on 2026-11-01 with Bun 1.4.4, restic **0.19.1** (Go 1.26.4), and the pinned Proton SDK `b68d64bd9f9c1f24be521c8b423c26f5dca1c681`. ARM64 execution uses QEMU; it is not a physical ARM board test.
 
+## Version 0.2 validation: headless login and production performance fixes
+
+The current suite has 28 tests. In addition to the original fault/recovery cases below, it verifies:
+
+- A 10,000-object directory: 1,000 successful point lookups and 100 misses require one complete directory traversal. Explicit REST listings still traverse completely and fail on broken pages.
+- Drive node events update lookups without rescanning; refresh events invalidate and rebuild. Concurrent identical POSTs publish one remote object and return four valid acknowledgments.
+- Four concurrent ranges share one verified pack download. LRU eviction, capacity reservations, pinned entries, cancellation of one/all waiters and corrupt local cache files are exercised.
+- Full GETs and full-object ranges bypass a good cache and detect injected remote corruption. A cached partial read may return previously verified immutable bytes, so remote-integrity tests now deliberately use full reads.
+- Slow writes and saturated transfer admission do not block healthchecks. In a live-account sample, all 20 health requests returned successfully, with a maximum measured latency of 23 ms on this host.
+- AES-256-GCM session migration, encrypted reload, wrong/missing keys, modified nonce/tag/ciphertext, truncated authentication tags and unknown versions fail closed. Session access/refresh tokens are not present in the stored envelope.
+- The official account SDK's browser-fork flow handles a pending-approval response, receives an authenticated encrypted payload, hands the resulting credentials to the session store, and can be canceled. No callback listener or pasted redirect is used. The live test account does not have 2FA enabled, so actual second-factor interaction remains a manual browser test; the SDK protocol/approval exchange is covered with a fixture.
+
+The expanded real-restic fault campaign passed with the lookup index, four transfer slots and pack cache enabled. The existing live Proton state volume migrated to an encrypted session and completed another baseline/incremental backup, container pause/network removal/SIGKILL recovery, full checks, both cold-cache restores, retention and post-prune restore. The repository layout did not change. Session encryption uses a separately mounted test key; no credentials or keys are committed.
+
 ## Repeatable tests
 
 ```sh
@@ -11,9 +25,9 @@ bun run test
 RESTIC_BIN=/path/to/restic bun run stress
 ```
 
-The automated stress test uses the production HTTP handler and DriveStore with a fault-injectable implementation of the SDK boundary. It runs a real restic client through a socket-dropping, throttled HTTP proxy. It does not require a Proton account. All its repositories and fixtures are temporary. It retains logs and artifacts under the path printed at the end.
+The automated stress test uses the production HTTP handler, DriveStore and verified pack cache with a fault-injectable implementation of the SDK boundary. It runs a real restic client through a socket-dropping, throttled HTTP proxy. It does not require a Proton account. All its repositories and fixtures are temporary. It retains logs and artifacts under the path printed at the end.
 
-The 19 unit/integration tests cover:
+The original unit/integration coverage includes:
 
 - HTTP v1/v2, authentication, exact lengths, range boundaries, zero-length objects and unknown REST versions.
 - Truncated/slow incoming bodies, canceled outgoing streams, saturated admission queues, an expired transfer deadline and unavailable spool storage. Healthy requests must work afterward.
@@ -24,7 +38,7 @@ The 19 unit/integration tests cover:
 - Crash recovery after trash, before permanent deletion, and after a lost permanent-deletion acknowledgment. A fresh provider/store reconstructs state from disk, retries are idempotent, and an unrelated node survives.
 - Sixty-four cycles of mixed writes, ranges and deletes with injected lost acknowledgments.
 
-The real-restic stress test has been run five times with independently generated random data. The final expanded run covers:
+The initial campaign ran the real-restic stress test five times with independently generated random data; the version 0.2 campaign above adds runs with indexing and caching enabled. The final expanded run covers:
 
 | Scenario | Required result | Observed |
 | --- | --- | --- |
@@ -33,7 +47,7 @@ The real-restic stress test has been run five times with independently generated
 | Download drops and failed listing pages | Full data check and latest/historical restores succeed after retries | Pass |
 | SIGKILL/restart of the test server | Persisted repository remains readable and restorable | Pass |
 | Retention and prune | Full check and restore of retained snapshot succeed | Pass |
-| Corrupt committed pack; one-byte range requested | Server fails before sending object content | Pass |
+| Corrupt committed pack; full remote read requested | Server fails before sending object content | Pass |
 | Missing committed pack | Both check and restore fail; restoring the provider object permits a verified restore | Pass |
 | Wrong repository password | Repository access fails | Pass |
 | Restore over damaged files with stale extras | `--verify --delete --sparse` reconstructs the manifest | Pass |

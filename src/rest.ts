@@ -2,6 +2,7 @@ import { timingSafeEqual } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { PackCache } from './pack-cache';
 import { DriveStore, HttpError, MAX, size, types } from './store';
 
 export function range(header: string | null, length: number): [number, number] | undefined {
@@ -15,27 +16,24 @@ export function range(header: string | null, length: number): [number, number] |
     return [start, end];
 }
 
-export function handler(store: DriveStore, token: string, spoolDir = tmpdir()) {
+export function handler(store: DriveStore, token: string, spoolDir = tmpdir(), cache?: PackCache) {
     const expected = Buffer.from(`Basic ${Buffer.from(`backup:${token}`).toString('base64')}`);
-    let tail: Promise<unknown> = Promise.resolve();
     let pending = 0;
     return async (request: Request): Promise<Response> => {
         const auth = Buffer.from(request.headers.get('authorization') || '');
         if (auth.length !== expected.length || !timingSafeEqual(auth, expected))
             return new Response('Unauthorized', { status: 401, headers: { 'WWW-Authenticate': 'Basic realm="backup"' } });
-        if (pending >= 8) return new Response('Busy', { status: 503, headers: { 'Retry-After': '2' } });
+        const pathName = new URL(request.url).pathname;
+        if (pathName === '/health' && request.method === 'GET') return new Response('OK');
+        if (pending >= 4) return new Response('Busy', { status: 503, headers: { 'Retry-After': '2' } });
         pending++;
-        const previous = tail;
-        const { promise, resolve } = Promise.withResolvers<void>();
-        tail = promise;
-        await previous;
         let dir: string | undefined;
         let streaming = false;
+        let lease: { path: string; release: () => Promise<void> } | undefined;
         try {
             request.signal.throwIfAborted();
             const url = new URL(request.url);
             const path = url.pathname;
-            if (path === '/health' && request.method === 'GET') return new Response('OK');
             const accept = request.headers.get('accept');
             if (accept?.includes('application/vnd.x.restic.rest.') && !['application/vnd.x.restic.rest.v1', 'application/vnd.x.restic.rest.v2'].includes(accept))
                 throw new HttpError(406, 'Unsupported REST protocol version');
@@ -87,12 +85,15 @@ export function handler(store: DriveStore, token: string, spoolDir = tmpdir()) {
             let slice;
             try { slice = range(request.headers.get('range'), length); }
             catch (error) { headers.set('Content-Length', '0'); headers.set('Content-Range', `bytes */${length}`); return new Response(null, { status: 416, headers }); }
-            await store.read(node, objectPath, request.signal);
+            const partial = slice && (slice[0] !== 0 || slice[1] !== length - 1);
+            if (type === 'data' && partial && cache)
+                lease = await cache.acquire(id, length, (path, signal) => store.read(node, path, signal), request.signal);
+            if (!lease) await store.read(node, objectPath, request.signal);
             const [start, end] = slice || [0, length - 1];
             headers.set('Content-Length', String(Math.max(0, end - start + 1)));
             if (slice) headers.set('Content-Range', `bytes ${start}-${end}/${length}`);
-            // Keep at most one response spool alive; backpressure also bounds disk use.
-            const reader = Bun.file(objectPath).slice(start, end + 1).stream().getReader();
+            // Keep the transfer slot and cache lease until the response is consumed.
+            const reader = Bun.file(lease?.path || objectPath).slice(start, end + 1).stream().getReader();
             const responseDir = dir;
             dir = undefined;
             streaming = true;
@@ -102,8 +103,8 @@ export function handler(store: DriveStore, token: string, spoolDir = tmpdir()) {
                 released = true;
                 try { await reader.cancel(); }
                 finally {
-                    try { await rm(responseDir, { recursive: true, force: true }); }
-                    finally { pending--; resolve(); }
+                    try { await lease?.release(); await rm(responseDir, { recursive: true, force: true }); }
+                    finally { pending--; }
                 }
             };
             return new Response(new ReadableStream({
@@ -122,8 +123,8 @@ export function handler(store: DriveStore, token: string, spoolDir = tmpdir()) {
                 status: error instanceof HttpError ? error.status : 500,
             });
         } finally {
-            try { if (dir) await rm(dir, { recursive: true, force: true }); }
-            finally { if (!streaming) { pending--; resolve(); } }
+            try { if (!streaming) await lease?.release(); if (dir) await rm(dir, { recursive: true, force: true }); }
+            finally { if (!streaming) { pending--; } }
         }
     };
 }

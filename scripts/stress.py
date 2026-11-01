@@ -254,14 +254,14 @@ try:
     bad = subprocess.run([RESTIC, 'snapshots'], env=wrong_env, capture_output=True, timeout=30)
     assert bad.returncode != 0
     # Corrupt a committed remote object on disk: the server must return a
-    # failed read, never serve unverified bytes, even for a one-byte range.
+    # failed read, never serve unverified bytes, on a full read, regardless of cached partial reads.
     nodes = json.loads((provider / 'remote/nodes.json').read_text())
     pack = next(n for n in nodes.values() if n['name'].get('ok') and len(n['name']['value']) == 64
                 and n.get('activeRevision', {}).get('claimedSize', 0) > 1000000)
     path = provider / 'remote' / pack['uid']
     original = path.read_bytes()
     path.write_bytes(bytes([original[0] ^ 1]) + original[1:])
-    req = urllib.request.Request(f'http://127.0.0.1:{backend_port}/data/{pack["name"]["value"]}', headers={'Authorization': AUTH, 'Range': 'bytes=0-0'})
+    req = urllib.request.Request(f'http://127.0.0.1:{backend_port}/data/{pack["name"]["value"]}', headers={'Authorization': AUTH})
     try:
         urllib.request.urlopen(req, timeout=30)
         raise AssertionError('Corrupt object served successfully')

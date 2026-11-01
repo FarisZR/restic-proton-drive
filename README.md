@@ -5,15 +5,17 @@ Store a restic repository in Proton Drive. The Docker image runs the REST server
 ## Start
 
 ```sh
-mkdir restic-proton-drive && cd restic-proton-drive
+mkdir -m 700 restic-proton-drive && cd restic-proton-drive
+openssl rand -hex 32 > session-key
+chmod 644 session-key
 curl -fsSLO https://raw.githubusercontent.com/FarisZR/restic-proton-drive/main/compose.yaml
 docker compose pull
-docker compose run --rm drive login
+docker compose run --rm drive login --headless
 docker compose run --rm drive create backups
 docker compose up -d --wait
 ```
 
-Open the login URL in your browser. For accounts without 2FA, `login your-username` also accepts a hidden password prompt.
+Open the URL on your laptop or phone and complete login, including 2FA. Keep the terminal running; no browser or redirect listener is needed on the server. Accounts without 2FA can also use `login your-username` with a hidden password prompt.
 
 Configure restic in your shell:
 
@@ -31,11 +33,13 @@ restic restore latest --target /path/to/restore
 
 Create and keep a secure copy of your restic password before initializing. It is separate from your Proton password and is required for recovery.
 
-The `drive-state` Docker volume keeps your Proton session, server token, caches and pending deletions across restarts. Keep it private and retain it when updating. The server is published only on localhost. For a restic client in another container, join the Compose network and use `rest:http://drive:8000/`.
+Keep `session-key` in this private deployment directory, outside the `drive-state` volume. It encrypts the Proton session; Compose mounts it as a secret. Retain both the key and volume across updates. The server is published only on localhost. For a restic client in another container, join the Compose network and use `rest:http://drive:8000/`.
 
-Use restic's default pack size. The server accepts objects up to 64 MiB and uses at most 128 MiB of temporary transfer files, plus metadata caches. Run one server per repository and manage its files through restic.
+Use restic's default pack size. The server accepts objects up to 64 MiB and uses a bounded 256 MiB verified-pack cache and up to 512 MiB of temporary transfer files, plus metadata caches. Run one server per repository and manage its files through restic.
 
 ## Update and maintain
+
+Upgrading an older install? [Add the session encryption key first](docs/operations.md#session-encryption-and-migration).
 
 ```sh
 docker compose pull

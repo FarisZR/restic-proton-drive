@@ -1,6 +1,7 @@
 import { mkdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Provider } from './provider';
+import { PackCache } from '../../src/pack-cache';
 import { DriveStore } from '../../src/store';
 import { handler } from '../../src/rest';
 import { httpServer } from '../../src/http';
@@ -11,7 +12,8 @@ await provider.open();
 const store = new DriveStore(provider.sdk, 'root', dir);
 await store.open();
 const spool = join(dir, 'spool'); await rm(spool, { recursive: true, force: true }); await mkdir(spool);
-const handle = handler(store, 'test-token-'.repeat(4), spool);
+const cache = new PackCache(join(dir, 'verified-packs')); await cache.open();
+const handle = handler(store, 'test-token-'.repeat(4), spool, cache);
 const server = httpServer(async request => {
     if (new URL(request.url).pathname === '/_control') {
         const options = await request.json(); provider.faults = options;

@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { open, rename, rm } from 'node:fs/promises';
 import { join } from 'node:path';
-import { NodeType, type NodeEntity, type ProtonDriveClient } from '@protontech/drive-sdk';
+import { DriveEventType, type DriveEvent, NodeType, type NodeEntity, type ProtonDriveClient } from '@protontech/drive-sdk';
 
 export const types = ['data', 'index', 'keys', 'locks', 'snapshots'];
 export const MAX = 64 * 1024 * 1024;
@@ -31,6 +31,82 @@ export async function digest(file: Blob, algorithm: string) {
 export class DriveStore {
     private folders = new Map<string, string>();
     private journal: string;
+    private indexes = new Map<string, Map<string, NodeEntity>>();
+    private reverse = new Map<string, string>();
+    private scans = new Map<string, Promise<Map<string, NodeEntity>>>();
+    private generation = 0;
+    private mutation: Promise<unknown> = Promise.resolve();
+    private eventQueue: Promise<void> = Promise.resolve();
+    private exclusive<T>(action: () => Promise<T>): Promise<T> {
+        const next = this.mutation.then(action);
+        this.mutation = next.catch(() => {});
+        return next;
+    }
+    private invalidate(uid?: string) {
+        this.generation++;
+        if (uid) {
+            for (const node of this.indexes.get(uid)?.values() || []) this.reverse.delete(node.uid);
+            this.indexes.delete(uid);
+        } else { this.indexes.clear(); this.reverse.clear(); }
+    }
+    private remember(parent: string, node: NodeEntity) {
+        this.generation++;
+        const n = name(node);
+        const index = this.indexes.get(parent);
+        if (index) {
+            const conflict = index.get(n);
+            if (conflict && conflict.uid !== node.uid) { this.invalidate(parent); throw new Error('Duplicate Drive name'); }
+            const old = this.reverse.get(node.uid);
+            if (old && old !== n) index.delete(old);
+            index.set(n, node);
+        }
+        this.reverse.set(node.uid, n);
+    }
+    // SDK listeners must never throw. Invalidate on errors, then rebuild on demand.
+    handleEvent(event: DriveEvent): Promise<void> {
+        if (event.type === DriveEventType.FastForward || event.type === DriveEventType.SharedWithMeUpdated) return Promise.resolve();
+        this.generation++;
+        this.eventQueue = this.eventQueue.then(async () => {
+            if (![DriveEventType.NodeCreated, DriveEventType.NodeUpdated, DriveEventType.NodeDeleted].includes(event.type)) {
+                this.invalidate(); return;
+            }
+            if (!('nodeUid' in event)) return;
+            const erase = () => {
+                const old = this.reverse.get(event.nodeUid);
+                for (const index of this.indexes.values()) if (old && index.get(old)?.uid === event.nodeUid) index.delete(old);
+                this.reverse.delete(event.nodeUid);
+            };
+            if (event.type === DriveEventType.NodeDeleted || ('isTrashed' in event && event.isTrashed)) { erase(); return; }
+            const node = await this.sdk.getNode(event.nodeUid);
+            name(node);
+            if (node.type === NodeType.File && !node.activeRevision) return;
+            if (node.parentUid === this.root || [...this.folders.values()].includes(node.parentUid || '')) {
+                erase(); this.remember(node.parentUid!, node);
+            } else if (this.reverse.has(node.uid)) { erase(); this.invalidate(); }
+        }).catch(() => { this.invalidate(); });
+        return this.eventQueue;
+    }
+    private async indexed(parent: string, fresh = false): Promise<Map<string, NodeEntity>> {
+        if (!fresh && this.indexes.has(parent)) return this.indexes.get(parent)!;
+        const existing = this.scans.get(parent);
+        if (existing) return existing;
+        const scan = (async () => {
+            for (let attempt = 0; attempt < 4; attempt++) {
+                const generation = this.generation;
+                const nodes = await this.children(parent);
+                if (generation !== this.generation) continue;
+                const index = new Map(nodes.map(node => [name(node), node]));
+                for (const node of this.indexes.get(parent)?.values() || []) this.reverse.delete(node.uid);
+                this.indexes.set(parent, index);
+                for (const node of nodes) this.reverse.set(node.uid, name(node));
+                return index;
+            }
+            throw new HttpError(503, 'Repository changed during listing; retry');
+        })();
+        this.scans.set(parent, scan);
+        try { return await scan; }
+        finally { this.scans.delete(parent); }
+    }
     constructor(private sdk: ProtonDriveClient, private root: string, stateDir: string) {
         this.journal = join(stateDir, `delete-${createHash('sha256').update(root).digest('hex')}.json`);
     }
@@ -39,7 +115,7 @@ export class DriveStore {
         name(root);
         if (root.type !== NodeType.Folder || root.trashTime) throw new Error('Repository must be an active folder');
         await this.recoverDeletion();
-        for (const node of await this.children(this.root)) {
+        for (const node of (await this.indexed(this.root, true)).values()) {
             const n = name(node);
             if (types.includes(n)) {
                 if (node.type !== NodeType.Folder) throw new Error('Invalid repository layout');
@@ -47,10 +123,13 @@ export class DriveStore {
             } else if (n !== 'config') throw new Error('Use a dedicated repository folder');
         }
     }
-    async create() {
+    create() { return this.exclusive(() => this.createInternal()); }
+    private async createInternal() {
         for (const type of types) if (!this.folders.has(type)) {
             const node = await this.sdk.createFolder(this.root, type);
             this.folders.set(type, node.uid);
+            this.remember(this.root, node);
+            this.indexes.set(node.uid, new Map());
         }
     }
     private parent(type: string) {
@@ -71,14 +150,23 @@ export class DriveStore {
         return result;
     }
     async list(type: string) {
-        return (await this.children(this.parent(type))).map(node => {
+        return [...(await this.indexed(this.parent(type), true)).values()].map(node => {
             const n = name(node);
             if (!/^[a-f0-9]{64}$/.test(n)) throw new Error('Unexpected repository entry');
             return { name: n, size: size(node) };
         });
     }
     async find(type: string, id: string) {
-        return (await this.children(this.parent(type))).find(node => name(node) === id);
+        const parent = this.parent(type);
+        const known = (await this.indexed(parent)).get(id);
+        if (!known) return;
+        try {
+            const node = await this.sdk.getNode(known.uid);
+            name(node);
+            if (node.trashTime || node.parentUid !== parent) { this.invalidate(parent); throw new Error('Repository object moved or trashed'); }
+            if (name(node) !== id) { this.invalidate(parent); throw new Error('Repository object renamed'); }
+            return node;
+        } catch (error) { this.invalidate(parent); throw error; }
     }
     async read(node: NodeEntity, path: string, signal?: AbortSignal) {
         const expected = size(node);
@@ -100,7 +188,14 @@ export class DriveStore {
         if (id !== 'config' && await digest(Bun.file(path), 'sha256') !== id)
             throw new Error('Restic object digest mismatch');
     }
-    async put(type: string, id: string, path: string, signal?: AbortSignal) {
+    put(type: string, id: string, path: string, signal?: AbortSignal) {
+        return this.exclusive(async () => {
+            signal?.throwIfAborted();
+            try { await this.putInternal(type, id, path, signal); }
+            catch (error) { this.invalidate(this.parent(type)); throw error; }
+        });
+    }
+    private async putInternal(type: string, id: string, path: string, signal?: AbortSignal) {
         const file = Bun.file(path);
         const sha1 = await digest(file, 'sha1');
         if (type !== 'config' && await digest(file, 'sha256') !== id)
@@ -123,12 +218,20 @@ export class DriveStore {
         const { nodeUid } = await controller.completion();
         const checkPath = `${path}.committed`;
         try {
-            await this.read(await this.sdk.getNode(nodeUid), checkPath, signal);
+            const committed = await this.sdk.getNode(nodeUid);
+            await this.read(committed, checkPath, signal);
             if (await digest(Bun.file(checkPath), 'sha256') !== await digest(file, 'sha256'))
                 throw new Error('Committed content differs from uploaded content');
+            this.remember(this.parent(type), committed);
         } finally { await rm(checkPath, { force: true }); }
     }
-    async remove(type: string, id: string) {
+    remove(type: string, id: string) {
+        return this.exclusive(async () => {
+            try { await this.removeInternal(type, id); }
+            catch (error) { this.invalidate(this.parent(type)); throw error; }
+        });
+    }
+    private async removeInternal(type: string, id: string) {
         await this.recoverDeletion();
         const node = await this.find(type, id);
         if (!node) return;
@@ -153,6 +256,10 @@ export class DriveStore {
             if (!node.trashTime) await this.results(this.sdk.trashNodes([uid]));
             await this.results(this.sdk.deleteNodes([uid]));
         }
+        const oldName = this.reverse.get(uid);
+        for (const index of this.indexes.values()) if (oldName && index.get(oldName)?.uid === uid) index.delete(oldName);
+        this.reverse.delete(uid);
+        this.generation++;
         await rm(this.journal);
     }
     private async results(results: AsyncIterable<{ ok: boolean; error?: Error }>) {

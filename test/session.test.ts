@@ -41,7 +41,8 @@ test('expired access token refreshes once under concurrent requests and persists
     const logger = { debug() {}, info() {}, warn() {}, error() {} };
     const dir = await mkdtemp(join(tmpdir(), 'drive-refresh-'));
     const path = join(dir, 'session');
-    const credentials = new Credentials(new FileSessionStore(path), logger);
+    const key = Buffer.alloc(32, 31);
+    const credentials = new Credentials(new FileSessionStore(path, key), logger);
     await credentials.setSessionInfo({ uid: 'uid', accessToken: 'old', refreshToken: 'refresh' });
     await credentials.setUserKeyPassword('test-key-password');
     try {
@@ -49,8 +50,9 @@ test('expired access token refreshes once under concurrent requests and persists
         const responses = await Promise.all(Array.from({ length: 12 }, () => client.authenticatedRequest(String(server.url))));
         expect(responses.every(r => r.ok)).toBe(true);
         expect(refreshed).toBe(1); expect(credentials.refreshToken).toBe('refresh-new');
-        expect((await new FileSessionStore(path).load())?.session.accessToken).toBe('new');
-        expect((await new FileSessionStore(path).load())?.session.refreshToken).toBe('refresh-new');
+        expect((await new FileSessionStore(path, key).load())?.session.accessToken).toBe('new');
+        expect((await new FileSessionStore(path, key).load())?.session.refreshToken).toBe('refresh-new');
+        expect(await Bun.file(path).text()).not.toContain('\"accessToken\"');
     } finally { server.stop(true); await rm(dir, { recursive: true, force: true }); }
 });
 
@@ -67,4 +69,36 @@ test('session persistence failure preserves the previous on-disk credentials', a
         await store.save({ userKeyPassword: 'key', session: { uid: 'uid', accessToken: 'new' } });
         expect((await store.load())?.session.accessToken).toBe('new');
     } finally { await chmod(dir, 0o700); await rm(dir, { recursive: true, force: true }); }
+});
+
+test('encrypted session migration, reload, tamper protection and unknown versions fail closed', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'drive-encryption-')); const path = join(dir, 'session');
+    const key = Buffer.alloc(32, 77);
+    const snapshot = { userKeyPassword: 'PRIVATE-KEY-PASSWORD', session: { uid: 'uid', accessToken: 'PRIVATE-ACCESS-TOKEN', refreshToken: 'PRIVATE-REFRESH-TOKEN' } };
+    try {
+        await new FileSessionStore(path).save(snapshot); // legacy state
+        const encrypted = new FileSessionStore(path, key);
+        expect(await encrypted.load()).toEqual(snapshot);
+        const text = await Bun.file(path).text();
+        expect(text).not.toContain(snapshot.userKeyPassword);
+        expect(text).not.toContain(snapshot.session.accessToken);
+        expect(text).not.toContain(snapshot.session.refreshToken);
+        expect(await new FileSessionStore(path, key).load()).toEqual(snapshot);
+        await expect(new FileSessionStore(path, Buffer.alloc(32, 5)).load()).rejects.toThrow('Cannot decrypt');
+        await expect(new FileSessionStore(path).load()).rejects.toThrow('key is missing');
+        const envelope = JSON.parse(text);
+        for (const field of ['nonce', 'tag', 'ciphertext']) {
+            const damaged = structuredClone(envelope);
+            const bytes = Buffer.from(damaged[field], 'base64'); bytes[0] ^= 1;
+            damaged[field] = bytes.toString('base64');
+            await Bun.write(path, JSON.stringify(damaged));
+            await expect(encrypted.load()).rejects.toThrow('Cannot decrypt');
+        }
+        envelope.tag = Buffer.from(envelope.tag, 'base64').subarray(0, 4).toString('base64');
+        await Bun.write(path, JSON.stringify(envelope));
+        await expect(encrypted.load()).rejects.toThrow('Cannot decrypt');
+        envelope.version = 999;
+        await Bun.write(path, JSON.stringify(envelope));
+        await expect(encrypted.load()).rejects.toThrow('unsupported');
+    } finally { await rm(dir, { recursive: true, force: true }); }
 });

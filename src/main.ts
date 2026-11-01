@@ -6,12 +6,14 @@ import { randomBytes } from 'node:crypto';
 import { readPasswordLine } from '../sdk/cli/src/cli/readPasswordLine';
 import { DriveStore } from './store';
 import { handler } from './rest';
+import { headlessLogin } from './login';
+import { PackCache } from './pack-cache';
 import { VERSION } from '@protontech/drive-sdk';
 
 process.umask(0o077);
 const command = process.argv[2];
 const state = process.env.PROTON_DRIVE_CACHE_DIR;
-if (command === 'version') { console.log(`restic-proton-drive 0.1.0; Bun ${Bun.version}; SDK ${VERSION}`); process.exit(0); }
+if (command === 'version') { console.log(`restic-proton-drive 0.2.0; Bun ${Bun.version}; SDK ${VERSION}`); process.exit(0); }
 if (command === 'health') {
     if (!state) throw new Error('PROTON_DRIVE_CACHE_DIR is required');
     const token = (await Bun.file(process.env.REST_TOKEN_FILE || join(state, 'rest-token')).text()).trim();
@@ -28,11 +30,12 @@ try {
     if (command === 'login') {
         console.log('This is a third-party application not officially supported by Proton.');
         const username = process.argv[3];
-        if (username) {
+        if (username && username !== '--headless') {
+            if (username.startsWith('-')) throw new Error('Usage: login [--headless | username]');
             const password = await readPasswordLine('Password: ');
             await app.auth.authViaPassword(username, password);
         } else {
-            await app.auth.authViaWeb(url => { console.log(url); });
+            await headlessLogin(app.auth);
         }
         console.log('Signed in.');
         await app.dispose();
@@ -59,12 +62,15 @@ try {
     const token = (await Bun.file(tokenFile).text()).trim();
     if (token.length < 24) throw new Error('Use a random REST token of at least 24 characters');
     const store = new DriveStore(app.sdk, uid, app.config.appDir);
+    app.onEvent(event => store.handleEvent(event));
     await store.open();
     await app.eventsManager.subscribeDriveScope((await app.sdk.getNode(uid)).treeEventScopeId);
     const spool = join(app.config.appDir, 'transfer');
     await rm(spool, { recursive: true, force: true });
     await mkdir(spool, { mode: 0o700 });
-    const fetch = handler(store, token, spool);
+    const cache = new PackCache(join(app.config.appDir, 'verified-packs'), Number(process.env.PACK_CACHE_MIB || 256) * 1024 * 1024);
+    await cache.open();
+    const fetch = handler(store, token, spool, cache);
     const server = httpServer(fetch);
     const port = Number(process.env.PORT || 8000);
     server.listen(port, process.env.HOST || '127.0.0.1', () => console.log(`Listening on http://127.0.0.1:${port}/`));
