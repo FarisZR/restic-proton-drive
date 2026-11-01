@@ -1,0 +1,16 @@
+{
+  "extends": "./sdk/cli/tsconfig.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@protontech/drive-sdk": ["sdk/client/js/src/index.ts"],
+      "@protontech/drive-sdk/*": ["sdk/client/js/src/*"],
+      "proton-drive-sdk-account": ["sdk/incubating/account/js/src/index.ts"],
+      "@protontech/crypto": ["node_modules/@protontech/crypto/src/index.ts"],
+      "@protontech/crypto/*": ["node_modules/@protontech/crypto/src/*"]
+    },
+    "typeRoots": ["node_modules/@types"],
+    "types": ["bun"]
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"]
+}
