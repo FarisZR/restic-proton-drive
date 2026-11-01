@@ -2,10 +2,12 @@ import { createServer } from 'node:http';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 
-export function httpServer(fetch: (request: Request) => Promise<Response>) {
+export function httpServer(fetch: (request: Request) => Promise<Response>, timeoutMs = 30 * 60 * 1000) {
     return createServer(async (incoming, outgoing) => {
         const abort = new AbortController();
-        outgoing.on('close', () => { if (!outgoing.writableFinished) abort.abort(); });
+        const deadline = setTimeout(() => { abort.abort(); incoming.destroy(); outgoing.destroy(); }, timeoutMs);
+        deadline.unref();
+        outgoing.on('close', () => { clearTimeout(deadline); if (!outgoing.writableFinished) abort.abort(); });
         try {
             const headers = new Headers();
             for (const [key, value] of Object.entries(incoming.headers))

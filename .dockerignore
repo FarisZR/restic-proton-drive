@@ -1,0 +1,15 @@
+**
+!Dockerfile
+!package.json
+!bun.lock
+!tsconfig.json
+!src/
+!src/**
+!sdk/
+!sdk/**
+sdk/.git
+sdk/**/node_modules
+sdk/**/dist
+
+!docker/
+!docker/**

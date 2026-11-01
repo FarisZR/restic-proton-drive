@@ -35,6 +35,10 @@ export function handler(store: DriveStore, token: string, spoolDir = tmpdir()) {
             request.signal.throwIfAborted();
             const url = new URL(request.url);
             const path = url.pathname;
+            if (path === '/health' && request.method === 'GET') return new Response('OK');
+            const accept = request.headers.get('accept');
+            if (accept?.includes('application/vnd.x.restic.rest.') && !['application/vnd.x.restic.rest.v1', 'application/vnd.x.restic.rest.v2'].includes(accept))
+                throw new HttpError(406, 'Unsupported REST protocol version');
             if (path === '/') {
                 if (request.method === 'POST' && url.search === '?create=true') {
                     await store.create(); return new Response();
@@ -58,6 +62,7 @@ export function handler(store: DriveStore, token: string, spoolDir = tmpdir()) {
             dir = await mkdtemp(join(spoolDir, 'restic-proton-'));
             const objectPath = join(dir, 'object');
             if (request.method === 'POST') {
+                if (Number(request.headers.get('content-length')) > MAX) throw new HttpError(413, 'Object exceeds 64 MiB');
                 const writer = Bun.file(objectPath).writer();
                 let count = 0;
                 try {
@@ -81,7 +86,7 @@ export function handler(store: DriveStore, token: string, spoolDir = tmpdir()) {
             if (request.method === 'HEAD') return new Response(null, { headers });
             let slice;
             try { slice = range(request.headers.get('range'), length); }
-            catch (error) { headers.set('Content-Range', `bytes */${length}`); return new Response(null, { status: 416, headers }); }
+            catch (error) { headers.set('Content-Length', '0'); headers.set('Content-Range', `bytes */${length}`); return new Response(null, { status: 416, headers }); }
             await store.read(node, objectPath, request.signal);
             const [start, end] = slice || [0, length - 1];
             headers.set('Content-Length', String(Math.max(0, end - start + 1)));

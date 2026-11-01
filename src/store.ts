@@ -120,7 +120,13 @@ export class DriveStore {
             mediaType: 'application/octet-stream', expectedSize: file.size, expectedSha1: sha1,
         }, signal);
         const controller = await uploader.uploadFromStream(file.stream(), []);
-        await controller.completion();
+        const { nodeUid } = await controller.completion();
+        const checkPath = `${path}.committed`;
+        try {
+            await this.read(await this.sdk.getNode(nodeUid), checkPath, signal);
+            if (await digest(Bun.file(checkPath), 'sha256') !== await digest(file, 'sha256'))
+                throw new Error('Committed content differs from uploaded content');
+        } finally { await rm(checkPath, { force: true }); }
     }
     async remove(type: string, id: string) {
         await this.recoverDeletion();

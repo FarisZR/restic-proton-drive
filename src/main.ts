@@ -1,23 +1,30 @@
 import { httpServer } from './http';
 import { mkdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
-import { init } from '../sdk/cli/src/init';
+import { initSession, atomicWrite } from './session';
+import { randomBytes } from 'node:crypto';
 import { readPasswordLine } from '../sdk/cli/src/cli/readPasswordLine';
 import { DriveStore } from './store';
 import { handler } from './rest';
+import { VERSION } from '@protontech/drive-sdk';
 
 process.umask(0o077);
 const command = process.argv[2];
+const state = process.env.PROTON_DRIVE_CACHE_DIR;
+if (command === 'version') { console.log(`restic-proton-drive 0.1.0; Bun ${Bun.version}; SDK ${VERSION}`); process.exit(0); }
+if (command === 'health') {
+    if (!state) throw new Error('PROTON_DRIVE_CACHE_DIR is required');
+    const token = (await Bun.file(process.env.REST_TOKEN_FILE || join(state, 'rest-token')).text()).trim();
+    const response = await fetch(`http://127.0.0.1:${process.env.PORT || 8000}/health`, {
+        headers: { authorization: `Basic ${Buffer.from(`backup:${token}`).toString('base64')}` }, signal: AbortSignal.timeout(4000) });
+    process.exit(response.ok ? 0 : 1);
+}
 if (!['login', 'create', 'serve'].includes(command)) {
-    console.log('Usage: bun start login [username] | create <folder-name> | serve\nConfigure PROTON_DRIVE_CACHE_DIR, REPOSITORY_UID, REST_TOKEN_FILE, PORT (default 8000).');
+    console.log('Usage: login [username] | create <folder-name> | serve | health | version');
     process.exit(1);
 }
-const app = await init({
-    appVersion: 'external-drive-restic_backup@0.1.0-alpha',
-    clientUidPrefix: 'restic-backup', enablePersistedEvents: true,
-});
+const app = await initSession();
 try {
-    if (!app.eventsProvider.canListenForEvents()) throw new Error('Another process is using this session directory');
     if (command === 'login') {
         console.log('This is a third-party application not officially supported by Proton.');
         const username = process.argv[3];
@@ -33,17 +40,22 @@ try {
     }
     if (!app.auth.isLoggedIn()) throw new Error('Run login first');
     if (command === 'create') {
+        if (await Bun.file(join(app.config.appDir, 'repository.uid')).exists()) throw new Error('A repository is already configured in this state directory');
         const folderName = process.argv[3];
         if (!folderName || /[\\/]/.test(folderName)) throw new Error('Provide a single folder name');
         const root = await app.sdk.getMyFilesRootFolder();
         const folder = await app.sdk.createFolder(root.uid, folderName);
-        console.log(`REPOSITORY_UID=${folder.uid}`);
+        await atomicWrite(join(app.config.appDir, 'repository.uid'), folder.uid);
+        for (const filename of ['rest-token']) {
+            const path = join(app.config.appDir, filename);
+            if (!await Bun.file(path).exists()) await atomicWrite(path, randomBytes(32).toString('hex') + '\n');
+        }
+        console.log(`Created ${folderName}. Ready to start the server.`);
         await app.dispose();
         process.exit(0);
     }
-    const uid = process.env.REPOSITORY_UID;
-    const tokenFile = process.env.REST_TOKEN_FILE;
-    if (!uid || !tokenFile) throw new Error('REPOSITORY_UID and REST_TOKEN_FILE are required');
+    const uid = process.env.REPOSITORY_UID || (await Bun.file(join(app.config.appDir, 'repository.uid')).text()).trim();
+    const tokenFile = process.env.REST_TOKEN_FILE || join(app.config.appDir, 'rest-token');
     const token = (await Bun.file(tokenFile).text()).trim();
     if (token.length < 24) throw new Error('Use a random REST token of at least 24 characters');
     const store = new DriveStore(app.sdk, uid, app.config.appDir);
@@ -55,7 +67,7 @@ try {
     const fetch = handler(store, token, spool);
     const server = httpServer(fetch);
     const port = Number(process.env.PORT || 8000);
-    server.listen(port, '127.0.0.1', () => console.log(`Listening on http://127.0.0.1:${port}/`));
+    server.listen(port, process.env.HOST || '127.0.0.1', () => console.log(`Listening on http://127.0.0.1:${port}/`));
     for (const signal of ['SIGINT', 'SIGTERM'] as const) process.on(signal, async () => {
         await new Promise<void>(resolve => server.close(() => resolve()));
         await app.dispose();

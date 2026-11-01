@@ -1,0 +1,13 @@
+services:
+  drive:
+    build: .
+    image: restic-proton-drive:local
+    init: true
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - drive-state:/state
+    stop_grace_period: 2m
+volumes:
+  drive-state:
