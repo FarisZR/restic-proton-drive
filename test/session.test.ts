@@ -17,11 +17,12 @@ test('SDK version/feature mismatch fails closed; compatible and suggested versio
 
 test('session writes serialize, stay private, reload and reject malformed persistent state', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'drive-session-')); const path = join(dir, 'session');
+    const key = Buffer.alloc(32, 7);
     try {
-        const store = new FileSessionStore(path);
+        const store = new FileSessionStore(path, key);
         const snapshot = (n: number) => ({ userKeyPassword: 'key-password', session: { uid: 'uid', accessToken: `token${n}`, refreshToken: 'refresh' } });
         await Promise.all(Array.from({ length: 50 }, (_, n) => store.save(snapshot(n))));
-        expect((await new FileSessionStore(path).load())?.session.accessToken).toBe('token49');
+        expect((await new FileSessionStore(path, key).load())?.session.accessToken).toBe('token49');
         expect((await stat(path)).mode & 0o777).toBe(0o600);
         await Bun.write(path, '{"session":');
         await expect(store.load()).rejects.toThrow();
@@ -59,7 +60,7 @@ test('expired access token refreshes once under concurrent requests and persists
 
 test('session persistence failure preserves the previous on-disk credentials', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'drive-store-failure-')); const path = join(dir, 'session');
-    const store = new FileSessionStore(path);
+    const store = new FileSessionStore(path, Buffer.alloc(32, 11));
     try {
         await store.save({ userKeyPassword: 'key', session: { uid: 'uid', accessToken: 'old' } });
         await chmod(dir, 0o500);
@@ -71,13 +72,13 @@ test('session persistence failure preserves the previous on-disk credentials', a
     } finally { await chmod(dir, 0o700); await rm(dir, { recursive: true, force: true }); }
 });
 
-test('encrypted session migration, reload, tamper protection and unknown versions fail closed', async () => {
+test('encrypted sessions reload, reject plaintext, and fail closed on tampering or unknown versions', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'drive-encryption-')); const path = join(dir, 'session');
     const key = Buffer.alloc(32, 77);
     const snapshot = { userKeyPassword: 'PRIVATE-KEY-PASSWORD', session: { uid: 'uid', accessToken: 'PRIVATE-ACCESS-TOKEN', refreshToken: 'PRIVATE-REFRESH-TOKEN' } };
     try {
-        await new FileSessionStore(path).save(snapshot); // legacy state
         const encrypted = new FileSessionStore(path, key);
+        await encrypted.save(snapshot);
         expect(await encrypted.load()).toEqual(snapshot);
         const text = await Bun.file(path).text();
         expect(text).not.toContain(snapshot.userKeyPassword);
@@ -85,7 +86,6 @@ test('encrypted session migration, reload, tamper protection and unknown version
         expect(text).not.toContain(snapshot.session.refreshToken);
         expect(await new FileSessionStore(path, key).load()).toEqual(snapshot);
         await expect(new FileSessionStore(path, Buffer.alloc(32, 5)).load()).rejects.toThrow('Cannot decrypt');
-        await expect(new FileSessionStore(path).load()).rejects.toThrow('key is missing');
         const envelope = JSON.parse(text);
         for (const field of ['nonce', 'tag', 'ciphertext']) {
             const damaged = structuredClone(envelope);
@@ -99,6 +99,11 @@ test('encrypted session migration, reload, tamper protection and unknown version
         await expect(encrypted.load()).rejects.toThrow('Cannot decrypt');
         envelope.version = 999;
         await Bun.write(path, JSON.stringify(envelope));
-        await expect(encrypted.load()).rejects.toThrow('unsupported');
+        await expect(encrypted.load()).rejects.toThrow('Unsupported');
+        const plaintext = JSON.stringify(snapshot);
+        await Bun.write(path, plaintext);
+        await expect(encrypted.load()).rejects.toThrow('Unsupported');
+        expect(await Bun.file(path).text()).toBe(plaintext);
+        expect(() => new FileSessionStore(path, Buffer.alloc(0))).toThrow('32 bytes');
     } finally { await rm(dir, { recursive: true, force: true }); }
 });

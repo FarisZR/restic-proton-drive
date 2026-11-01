@@ -30,12 +30,11 @@ export async function atomicWrite(path: string, content: string) {
 // A serialized, atomic session store avoids a torn token file after a crash.
 export class FileSessionStore {
     private tail: Promise<unknown> = Promise.resolve();
-    constructor(private path: string, private key?: Buffer) {
-        if (key && key.length !== 32) throw new Error('Session key must contain 32 bytes');
+    constructor(private path: string, private key: Buffer) {
+        if (!key || key.length !== 32) throw new Error('Session key must contain 32 bytes');
     }
     private encode(snapshot: Snapshot) {
         const content = JSON.stringify(snapshot);
-        if (!this.key) return content;
         const nonce = randomBytes(12);
         const cipher = createCipheriv('aes-256-gcm', this.key, nonce);
         cipher.setAAD(Buffer.from('restic-proton-drive/session/v1'));
@@ -44,24 +43,20 @@ export class FileSessionStore {
     }
     async load() {
         if (!await Bun.file(this.path).exists()) return null;
-        const text = await Bun.file(this.path).text();
-        const envelope = JSON.parse(text);
-        let content = text;
-        if ('version' in envelope) {
-            if (envelope.version !== 1 || !this.key) throw new Error('Session encryption key is missing or format is unsupported');
-            try {
-                const nonce = Buffer.from(envelope.nonce, 'base64');
-                const tag = Buffer.from(envelope.tag, 'base64');
-                if (nonce.length !== 12 || tag.length !== 16) throw new Error('Invalid session envelope');
-                const decipher = createDecipheriv('aes-256-gcm', this.key, nonce);
-                decipher.setAAD(Buffer.from('restic-proton-drive/session/v1'));
-                decipher.setAuthTag(tag);
-                content = Buffer.concat([decipher.update(Buffer.from(envelope.ciphertext, 'base64')), decipher.final()]).toString('utf8');
-            } catch { throw new Error('Cannot decrypt session: incorrect key or damaged session file'); }
-        }
+        const envelope = await Bun.file(this.path).json();
+        if (envelope?.version !== 1) throw new Error('Unsupported session format');
+        let content: string;
+        try {
+            const nonce = Buffer.from(envelope.nonce, 'base64');
+            const tag = Buffer.from(envelope.tag, 'base64');
+            if (nonce.length !== 12 || tag.length !== 16) throw new Error('Invalid session envelope');
+            const decipher = createDecipheriv('aes-256-gcm', this.key, nonce);
+            decipher.setAAD(Buffer.from('restic-proton-drive/session/v1'));
+            decipher.setAuthTag(tag);
+            content = Buffer.concat([decipher.update(Buffer.from(envelope.ciphertext, 'base64')), decipher.final()]).toString('utf8');
+        } catch { throw new Error('Cannot decrypt session: incorrect key or damaged session file'); }
         const snapshot = parseStoredSnapshot(content);
         if (!snapshot) throw new Error('Invalid session file; restore it or remove it before logging in');
-        if (this.key && content === text) await this.save(snapshot); // atomic legacy migration
         return snapshot;
     }
     save(snapshot: Snapshot) {
@@ -111,7 +106,7 @@ export async function initSession() {
         } else throw new Error('Set SESSION_KEY_FILE to encrypt the file session, or use pass/keychain');
     }
     const credentials = config.credentialsStore === 'unsafe_file'
-        ? new Credentials(new FileSessionStore(join(config.appDir, 'auth-session.json'), sessionKey), logger)
+        ? new Credentials(new FileSessionStore(join(config.appDir, 'auth-session.json'), sessionKey!), logger)
         : initCredentials(config, logger);
     const apiClient = new ApiClient({ baseUrl: config.baseUrl, appVersion: config.appVersion, credentials, logger,
         headers: { 'x-pm-drive-sdk-version': VERSION },

@@ -39,8 +39,6 @@ Use restic's default pack size. The server accepts objects up to 64 MiB and uses
 
 ## Update and maintain
 
-Upgrading an older install? [Add the session encryption key first](docs/operations.md#session-encryption-and-migration).
-
 ```sh
 docker compose pull
 docker compose up -d --wait

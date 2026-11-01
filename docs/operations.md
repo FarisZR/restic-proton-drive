@@ -36,26 +36,13 @@ Run `docker compose run --rm drive login --headless` over SSH. Open its URL in a
 
 `login` without arguments uses the same browser flow. `login username` is the single-password alternative and does not implement an inline OTP prompt. Stop the server before reauthenticating so the state lock is available.
 
-## Session encryption and migration
+## Session encryption
 
 Sessions, including access/refresh tokens and the Drive user-key password, are stored using authenticated AES-256-GCM encryption. The master key is mounted separately from the state volume as a Docker secret. Missing/incorrect keys, damaged ciphertext and unsupported envelope versions fail closed. Refreshed sessions are encrypted and atomically persisted with fsync.
 
-For an existing installation, stop the old server, keep the volume, update Compose and create the key before starting the new image:
-
-```sh
-docker compose down  # retain volumes; do not use -v
-chmod 700 .
-# Create once. Do not overwrite an existing key.
-(test -e session-key || (umask 077; openssl rand -hex 32 > session-key))
-chmod 644 session-key
-curl -fsSLO https://raw.githubusercontent.com/FarisZR/restic-proton-drive/main/compose.yaml
-docker compose pull
-docker compose up -d --wait
-```
-
 The deployment directory is mode 0700 to restrict host access. The key file is mode 0644 so the non-root container can read the bind-mounted secret even when the host login UID differs from 1000. Keep that directory private. Compose mounts only the key file read-only. Other secret-management systems can mount their own key and set `SESSION_KEY_FILE` instead.
 
-On first startup, a valid legacy plaintext session is atomically replaced by an encrypted envelope; no plaintext backup file is created. Previously copied volumes/backups can still contain old plaintext credentials. Keep the key outside state-volume backups. Encryption protects a copied state volume; it does not protect a compromised running host/container with access to the mounted key. The REST authentication token remains a protected mode-0600 file. Restic's encryption password is separate and never stored by this server.
+Keep the key outside state-volume backups. Encryption protects a copied state volume; it does not protect a compromised running host/container with access to the mounted key. The REST authentication token remains a protected mode-0600 file. Restic's encryption password is separate and never stored by this server.
 
 If the key is lost, restore it or remove only `auth-session.json` and the two SDK cache SQLite files (including WAL/SHM files) while the server is stopped, then authenticate again with a new key. Keep `repository.uid`, `rest-token`, and deletion journals. Independent recovery of the repository still needs only Proton authentication and the restic repository password.
 
@@ -79,7 +66,7 @@ Only partial pack reads use the disk cache. Concurrent requests for the same pac
 
 Full GETs, ranges covering the whole object, and upload read-back verification always read Proton. Consequently `restic check --read-data` cannot succeed just because a good local cached copy masks remote damage or loss. Partial reads can reuse the previously verified immutable content. The first partial read still downloads the entire pack to retain full SDK verification. Cache hits save network bandwidth; they still hash local file contents. Restart discards the cache. `PACK_CACHE_MIB=0` restores uncached operation.
 
-The default cache is 256 MiB. Four admitted transfers use at most 512 MiB of temporary files in addition to that cache; no full repository mirror is kept. The repository layout is unchanged, so existing repositories need no migration.
+The default cache is 256 MiB. Four admitted transfers use at most 512 MiB of temporary files in addition to that cache; no full repository mirror is kept. The repository uses the standard Restic REST layout.
 
 ## Independent recovery
 
