@@ -5,14 +5,15 @@ import { CryptoProxy } from '@protontech/crypto';
 import { Api as CryptoApi } from '@protontech/crypto/proxy/endpoint/api.ts';
 import { computeKeyPassword, generateKeySalt, getRandomSrpVerifier, getSrp } from '@protontech/crypto/srp';
 import { OpenPGPCryptoWithCryptoProxy, ProtonDriveClient, type DriveEvent, VERSION } from '@protontech/drive-sdk';
-import { ApiClient, initAccount } from 'proton-drive-sdk-account';
+import { initAccount } from 'proton-drive-sdk-account';
 import { DriveAccountAdapter } from '../sdk/cli/src/api/driveAccountAdapter';
-import { HTTPClient } from '../sdk/cli/src/api/httpClient';
+import { RequestHTTPClient } from './request-context';
+import { DurableCredentials, SessionApiClient } from './credentials';
 import { createServerTimeAfterResponseHook } from '../sdk/cli/src/api/serverTimeHook';
 import { createCaches } from '../sdk/cli/src/cache';
 import { getConfig } from '../sdk/cli/src/config';
-import { initCredentials } from '../sdk/cli/src/credentials';
-import { Credentials } from '../sdk/cli/src/credentials/credentials';
+import { PassSessionStore } from '../sdk/cli/src/credentials/passCredentialsStore';
+import { SecretsSessionStore } from '../sdk/cli/src/credentials/secretCredentialsStore';
 import { parseStoredSnapshot } from '../sdk/cli/src/credentials/parseCredentials';
 import type { Credentials as Snapshot } from '../sdk/cli/src/credentials/interface';
 import { getOrGenerateClientUid } from '../sdk/cli/src/clientUid';
@@ -86,7 +87,7 @@ export function assertRequirements(headers: Headers, version = VERSION) {
 
 export async function initSession() {
     process.env.PROTON_DRIVE_LOG_LEVEL ||= 'WARNING';
-    const config = getConfig({ appVersion: 'external-drive-restic_backup@0.2.0-alpha',
+    const config = getConfig({ appVersion: 'external-drive-restic_backup@0.3.0-alpha',
         sdkVersion: VERSION, clientUidPrefix: 'restic-backup', enablePersistedEvents: true });
     if (config.baseUrl !== 'drive-api.proton.me') throw new Error('Only the official Drive endpoint is supported');
     await Promise.all([config.appDir, config.cacheDir, config.logDir].map(p => mkdir(p, { recursive: true, mode: 0o700 })));
@@ -105,17 +106,18 @@ export async function initSession() {
             sessionKey = Buffer.from(key, 'hex');
         } else throw new Error('Set SESSION_KEY_FILE to encrypt the file session, or use pass/keychain');
     }
-    const credentials = config.credentialsStore === 'unsafe_file'
-        ? new Credentials(new FileSessionStore(join(config.appDir, 'auth-session.json'), sessionKey!), logger)
-        : initCredentials(config, logger);
-    const apiClient = new ApiClient({ baseUrl: config.baseUrl, appVersion: config.appVersion, credentials, logger,
+    const storage = config.credentialsStore === 'unsafe_file'
+        ? new FileSessionStore(join(config.appDir, 'auth-session.json'), sessionKey!)
+        : config.credentialsStore === 'pass' ? new PassSessionStore(logger) : new SecretsSessionStore(logger);
+    const credentials = new DurableCredentials(storage, logger);
+    const apiClient = new SessionApiClient({ baseUrl: config.baseUrl, appVersion: config.appVersion, credentials, logger,
         headers: { 'x-pm-drive-sdk-version': VERSION },
         afterResponseHooks: [(_request, _options, response) => { assertRequirements(response.headers); }, createServerTimeAfterResponseHook()] });
     const { auth, addresses, srp } = await initAccount({ authClientId: config.authClientId, apiClient, credentials,
         cryptoProxy: CryptoProxy, srpApi: { computeKeyPassword, generateKeySalt, getRandomSrpVerifier, getSrp }, logger });
     const caches = createCaches(config, credentials, logger);
     const sdk = new ProtonDriveClient({ config: { baseUrl: config.baseUrl, clientUid: await getOrGenerateClientUid(config, logger) },
-        httpClient: new HTTPClient(apiClient), ...caches, telemetry,
+        httpClient: new RequestHTTPClient(apiClient), ...caches, telemetry,
         openPGPCryptoModule: new OpenPGPCryptoWithCryptoProxy(CryptoProxy),
         account: new DriveAccountAdapter(addresses), srpModule: srp, latestEventIdProvider: eventsProvider });
     let listener = async (_event: DriveEvent) => {};
@@ -129,6 +131,6 @@ export async function initSession() {
     };
     const eventsManager = await Manager.create(logger, eventSdk, eventSdk, eventsProvider, auth.isLoggedIn());
     return { sdk, auth, config, eventsManager, onEvent: (callback: typeof listener) => { listener = callback; }, dispose: async () => {
-        await eventsManager.dispose(); await eventsProvider.dispose(); await flush();
+        await eventsManager.dispose(); await eventsProvider.dispose(); await credentials.close(); await flush();
     } };
 }

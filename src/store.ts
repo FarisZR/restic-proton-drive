@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
-import { open, rename, rm } from 'node:fs/promises';
-import { join } from 'node:path';
+import { open, rm } from 'node:fs/promises';
+import { SerialQueue, withSignal } from './request-context';
 import { DriveEventType, type DriveEvent, NodeType, type NodeEntity, type ProtonDriveClient } from '@protontech/drive-sdk';
 
 export const types = ['data', 'index', 'keys', 'locks', 'snapshots'];
@@ -21,26 +21,23 @@ export function size(node: NodeEntity): number {
         throw new Error('Invalid or unsupported object size');
     return n!;
 }
-export async function digest(file: Blob, algorithm: string) {
+export async function digest(file: Blob, algorithm: string, signal?: AbortSignal) {
     const hash = createHash(algorithm);
-    for await (const chunk of file.stream()) hash.update(chunk);
+    for await (const chunk of file.stream()) { signal?.throwIfAborted(); hash.update(chunk); }
     return hash.digest('hex');
 }
 
 // One dedicated repository folder, accessed by one adapter process.
 export class DriveStore {
     private folders = new Map<string, string>();
-    private journal: string;
     private indexes = new Map<string, Map<string, NodeEntity>>();
     private reverse = new Map<string, string>();
-    private scans = new Map<string, Promise<Map<string, NodeEntity>>>();
     private generation = 0;
-    private mutation: Promise<unknown> = Promise.resolve();
+    private mutations = new SerialQueue();
+    private lockMutations = new SerialQueue();
     private eventQueue: Promise<void> = Promise.resolve();
-    private exclusive<T>(action: () => Promise<T>): Promise<T> {
-        const next = this.mutation.then(action);
-        this.mutation = next.catch(() => {});
-        return next;
+    private exclusive<T>(type: string, signal: AbortSignal | undefined, action: () => Promise<T>) {
+        return (type === 'locks' ? this.lockMutations : this.mutations).run(signal, action);
     }
     private invalidate(uid?: string) {
         this.generation++;
@@ -86,35 +83,53 @@ export class DriveStore {
         }).catch(() => { this.invalidate(); });
         return this.eventQueue;
     }
-    private async indexed(parent: string, fresh = false): Promise<Map<string, NodeEntity>> {
+    private async indexed(parent: string, fresh = false, signal?: AbortSignal): Promise<Map<string, NodeEntity>> {
+        signal?.throwIfAborted();
         if (!fresh && this.indexes.has(parent)) return this.indexes.get(parent)!;
-        const existing = this.scans.get(parent);
-        if (existing) return existing;
-        const scan = (async () => {
-            for (let attempt = 0; attempt < 4; attempt++) {
-                const generation = this.generation;
-                const nodes = await this.children(parent);
-                if (generation !== this.generation) continue;
-                const index = new Map(nodes.map(node => [name(node), node]));
-                for (const node of this.indexes.get(parent)?.values() || []) this.reverse.delete(node.uid);
-                this.indexes.set(parent, index);
-                for (const node of nodes) this.reverse.set(node.uid, name(node));
-                return index;
-            }
-            throw new HttpError(503, 'Repository changed during listing; retry');
-        })();
-        this.scans.set(parent, scan);
-        try { return await scan; }
-        finally { this.scans.delete(parent); }
+        for (let attempt = 0; attempt < 4; attempt++) {
+            const generation = this.generation;
+            const nodes = await this.children(parent, signal);
+            signal?.throwIfAborted();
+            if (generation !== this.generation) continue;
+            const index = new Map(nodes.map(node => [name(node), node]));
+            for (const node of this.indexes.get(parent)?.values() || []) this.reverse.delete(node.uid);
+            this.indexes.set(parent, index);
+            for (const node of nodes) this.reverse.set(node.uid, name(node));
+            return index;
+        }
+        throw new HttpError(503, 'Repository changed during listing; retry');
     }
-    constructor(private sdk: ProtonDriveClient, private root: string, stateDir: string) {
-        this.journal = join(stateDir, `delete-${createHash('sha256').update(root).digest('hex')}.json`);
+    constructor(private sdk: ProtonDriveClient, private root: string, private auditUploads = false) {}
+    private async node(uid: string, signal?: AbortSignal) {
+        const nodes = await this.metadata([uid], signal);
+        return nodes[0];
+    }
+    private metadata(ids: string[], signal?: AbortSignal) {
+        return withSignal(signal, () => this.metadataInternal(ids, signal));
+    }
+    private async metadataInternal(ids: string[], signal?: AbortSignal) {
+        const expected = new Set(ids);
+        const nodes: NodeEntity[] = [];
+        let failure: Error | undefined;
+        // The pinned SDK's signaled mapper can abandon in-flight decrypt jobs.
+        // Cancel its HTTP transport via context, but drain the mapper before
+        // releasing admission. Do not close this iterator on the first bad item.
+        for await (const result of this.sdk.iterateNodes(ids)) {
+            if (signal?.aborted) continue;
+            if ('missingUid' in result) { failure ||= new Error(`Missing metadata for enumerated node ${result.missingUid}`); continue; }
+            if (!expected.delete(result.uid)) { failure ||= new Error('Unexpected or duplicate metadata result'); continue; }
+            try { name(result); nodes.push(result); }
+            catch (error) { failure ||= error as Error; }
+        }
+        signal?.throwIfAborted();
+        if (failure) throw failure;
+        if (expected.size) throw new Error('Incomplete metadata response');
+        return nodes;
     }
     async open() {
         const root = await this.sdk.getNode(this.root);
         name(root);
         if (root.type !== NodeType.Folder || root.trashTime) throw new Error('Repository must be an active folder');
-        await this.recoverDeletion();
         for (const node of (await this.indexed(this.root, true)).values()) {
             const n = name(node);
             if (types.includes(n)) {
@@ -123,8 +138,9 @@ export class DriveStore {
             } else if (n !== 'config') throw new Error('Use a dedicated repository folder');
         }
     }
-    create() { return this.exclusive(() => this.createInternal()); }
-    private async createInternal() {
+    create(signal?: AbortSignal) { return this.exclusive('config', signal, () => this.createInternal(signal)); }
+    private async createInternal(signal?: AbortSignal) {
+        signal?.throwIfAborted();
         for (const type of types) if (!this.folders.has(type)) {
             const node = await this.sdk.createFolder(this.root, type);
             this.folders.set(type, node.uid);
@@ -138,37 +154,58 @@ export class DriveStore {
         if (!uid) throw new HttpError(503, 'Repository directory missing; initialize or repair the layout');
         return uid;
     }
-    private async children(uid: string) {
+    private children(uid: string, signal?: AbortSignal) {
+        return withSignal(signal, () => this.childrenInternal(uid, signal));
+    }
+    private async childrenInternal(uid: string, signal?: AbortSignal) {
         const result: NodeEntity[] = [];
-        const seen = new Set<string>();
-        for await (const node of this.sdk.iterateFolderChildren(uid)) {
-            const n = name(node);
-            if (seen.has(n)) throw new Error('Duplicate Drive name');
-            seen.add(n);
-            result.push(node);
+        const names = new Set<string>();
+        const ids = new Set<string>();
+        let batch: string[] = [];
+        const load = async () => {
+            for (const node of await this.metadata(batch, signal)) {
+                if (node.parentUid !== uid || node.trashTime) throw new Error('Directory changed during listing');
+                const n = name(node);
+                if (names.has(n)) throw new Error('Duplicate Drive name');
+                names.add(n); result.push(node);
+            }
+            batch = [];
+        };
+        // The convenience iterateFolderChildren() drops missingUid results.
+        // Enumerate IDs ourselves, then require exactly one metadata result per ID.
+        for await (const id of this.sdk.iterateFolderChildrenNodeUids(uid, undefined, signal)) {
+            signal?.throwIfAborted();
+            if (ids.has(id)) throw new Error('Duplicate child ID');
+            ids.add(id); batch.push(id);
+            if (batch.length === 30) await load();
         }
+        if (batch.length) await load();
+        signal?.throwIfAborted();
         return result;
     }
-    async list(type: string) {
-        return [...(await this.indexed(this.parent(type), true)).values()].map(node => {
+    async list(type: string, signal?: AbortSignal) {
+        return [...(await this.indexed(this.parent(type), true, signal)).values()].map(node => {
             const n = name(node);
             if (!/^[a-f0-9]{64}$/.test(n)) throw new Error('Unexpected repository entry');
             return { name: n, size: size(node) };
         });
     }
-    async find(type: string, id: string) {
+    async find(type: string, id: string, signal?: AbortSignal) {
         const parent = this.parent(type);
-        const known = (await this.indexed(parent)).get(id);
+        const known = (await this.indexed(parent, false, signal)).get(id);
         if (!known) return;
         try {
-            const node = await this.sdk.getNode(known.uid);
+            const node = await this.node(known.uid, signal);
             name(node);
             if (node.trashTime || node.parentUid !== parent) { this.invalidate(parent); throw new Error('Repository object moved or trashed'); }
             if (name(node) !== id) { this.invalidate(parent); throw new Error('Repository object renamed'); }
             return node;
         } catch (error) { this.invalidate(parent); throw error; }
     }
-    async read(node: NodeEntity, path: string, signal?: AbortSignal) {
+    read(node: NodeEntity, path: string, signal?: AbortSignal) {
+        return withSignal(signal, () => this.readInternal(node, path, signal));
+    }
+    private async readInternal(node: NodeEntity, path: string, signal?: AbortSignal) {
         const expected = size(node);
         const file = await open(path, 'wx', 0o600);
         let count = 0;
@@ -185,11 +222,11 @@ export class DriveStore {
             if (count !== expected) throw new Error('Truncated download');
         } finally { await file.close(); }
         const id = name(node);
-        if (id !== 'config' && await digest(Bun.file(path), 'sha256') !== id)
+        if (id !== 'config' && await digest(Bun.file(path), 'sha256', signal) !== id)
             throw new Error('Restic object digest mismatch');
     }
     put(type: string, id: string, path: string, signal?: AbortSignal) {
-        return this.exclusive(async () => {
+        return this.exclusive(type, signal, async () => {
             signal?.throwIfAborted();
             try { await this.putInternal(type, id, path, signal); }
             catch (error) { this.invalidate(this.parent(type)); throw error; }
@@ -197,16 +234,16 @@ export class DriveStore {
     }
     private async putInternal(type: string, id: string, path: string, signal?: AbortSignal) {
         const file = Bun.file(path);
-        const sha1 = await digest(file, 'sha1');
-        if (type !== 'config' && await digest(file, 'sha256') !== id)
+        const sha1 = await digest(file, 'sha1', signal);
+        if (type !== 'config' && await digest(file, 'sha256', signal) !== id)
             throw new HttpError(400, 'Object digest mismatch');
-        const existing = await this.find(type, id);
+        const existing = await this.find(type, id, signal);
         if (existing) {
             // Compare actual verified bytes, including config, before acknowledging a retry.
             const checkPath = `${path}.existing`;
             try {
                 await this.read(existing, checkPath, signal);
-                if (await digest(Bun.file(checkPath), 'sha256') !== await digest(file, 'sha256'))
+                if (await digest(Bun.file(checkPath), 'sha256') !== await digest(file, 'sha256', signal))
                     throw new HttpError(409, 'Immutable object already exists with different content');
             } finally { await rm(checkPath, { force: true }); }
             return;
@@ -215,52 +252,32 @@ export class DriveStore {
             mediaType: 'application/octet-stream', expectedSize: file.size, expectedSha1: sha1,
         }, signal);
         const controller = await uploader.uploadFromStream(file.stream(), []);
-        const { nodeUid } = await controller.completion();
-        const checkPath = `${path}.committed`;
-        try {
-            const committed = await this.sdk.getNode(nodeUid);
-            await this.read(committed, checkPath, signal);
-            if (await digest(Bun.file(checkPath), 'sha256') !== await digest(file, 'sha256'))
-                throw new Error('Committed content differs from uploaded content');
-            this.remember(this.parent(type), committed);
-        } finally { await rm(checkPath, { force: true }); }
-    }
-    remove(type: string, id: string) {
-        return this.exclusive(async () => {
-            try { await this.removeInternal(type, id); }
-            catch (error) { this.invalidate(this.parent(type)); throw error; }
-        });
-    }
-    private async removeInternal(type: string, id: string) {
-        await this.recoverDeletion();
-        const node = await this.find(type, id);
-        if (!node) return;
-        const record = { uid: node.uid, parent: this.parent(type) };
-        // Durable intent survives a crash between trashing and permanent deletion.
-        const file = await open(`${this.journal}.tmp`, 'w', 0o600);
-        try { await file.writeFile(JSON.stringify(record)); await file.sync(); }
-        finally { await file.close(); }
-        await rename(`${this.journal}.tmp`, this.journal);
-        const directory = await open(join(this.journal, '..'), 'r');
-        try { await directory.sync(); } finally { await directory.close(); }
-        await this.recoverDeletion();
-    }
-    private async recoverDeletion() {
-        if (!await Bun.file(this.journal).exists()) return;
-        const { uid, parent } = await Bun.file(this.journal).json();
-        const nodes = await Array.fromAsync(this.sdk.iterateNodes([uid]));
-        if (nodes.length !== 1) throw new Error('Incomplete deletion lookup');
-        const node = nodes[0];
-        if (!('missingUid' in node)) {
-            if (node.parentUid !== parent) throw new Error('Deletion target moved; manual review required');
-            if (!node.trashTime) await this.results(this.sdk.trashNodes([uid]));
-            await this.results(this.sdk.deleteNodes([uid]));
+        const { nodeUid, nodeRevisionUid } = await controller.completion();
+        const committed = await this.node(nodeUid, signal);
+        if (name(committed) !== id || size(committed) !== file.size || committed.activeRevision?.uid !== nodeRevisionUid)
+            throw new Error('Committed revision metadata differs from upload');
+        if (this.auditUploads) {
+            const checkPath = `${path}.audit`;
+            try {
+                await this.read(committed, checkPath, signal);
+                if (await digest(Bun.file(checkPath), 'sha256', signal) !== await digest(file, 'sha256', signal))
+                    throw new Error('Committed content differs from uploaded content');
+            } finally { await rm(checkPath, { force: true }); }
         }
-        const oldName = this.reverse.get(uid);
-        for (const index of this.indexes.values()) if (oldName && index.get(oldName)?.uid === uid) index.delete(oldName);
-        this.reverse.delete(uid);
-        this.generation++;
-        await rm(this.journal);
+        this.remember(this.parent(type), committed);
+    }
+    remove(type: string, id: string, signal?: AbortSignal) {
+        return this.exclusive(type, signal, async () => {
+            try {
+                const node = await this.find(type, id, signal);
+                if (!node) return;
+                await this.results(this.sdk.trashNodes([node.uid], signal));
+                const index = this.indexes.get(this.parent(type));
+                if (index?.get(id)?.uid === node.uid) index.delete(id);
+                this.reverse.delete(node.uid);
+                this.generation++;
+            } catch (error) { this.invalidate(this.parent(type)); throw error; }
+        });
     }
     private async results(results: AsyncIterable<{ ok: boolean; error?: Error }>) {
         let count = 0;

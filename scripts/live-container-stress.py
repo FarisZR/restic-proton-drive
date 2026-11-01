@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Destructive live test for a dedicated test repository and Docker container.
-Requires LIVE_DISPOSABLE=1, STRESS_CONTAINER, REST_TOKEN_FILE, RESTIC_PASSWORD_FILE.
-Only the named disposable container is paused/restarted/disconnected.
+"""Phase-synchronized live test; requires the separate fault-test image.
+LIVE_DISPOSABLE=1, STRESS_CONTAINER, FAULT_DIR, REST_TOKEN_FILE,
+RESTIC_PASSWORD_FILE and RESTIC_BIN must identify disposable test resources.
+FAULT_DIR must be bind-mounted at /fault with FAULT_DIR=/fault in the container.
 """
 import hashlib
 import json
@@ -14,8 +15,9 @@ import tempfile
 import threading
 import time
 
-assert os.environ.get('LIVE_DISPOSABLE') == '1', 'Set LIVE_DISPOSABLE=1 for a disposable repository'
+assert os.environ.get('LIVE_DISPOSABLE') == '1', 'Set LIVE_DISPOSABLE=1 only for a disposable repository'
 container = os.environ['STRESS_CONTAINER']
+fault_dir = Path(os.environ['FAULT_DIR']).resolve()
 restic = os.environ.get('RESTIC_BIN', 'restic')
 work = Path(tempfile.mkdtemp(prefix='restic-proton-live-'))
 source = work / 'source'
@@ -23,7 +25,6 @@ source.mkdir()
 (source / 'empty').touch()
 (source / 'empty directory').mkdir()
 (source / 'Unicode-Δ-文件\nnewline').write_text('restorable data')
-(source / 'random').write_bytes(os.urandom(12 * 1024 * 1024))
 (source / 'binary').write_bytes(bytes(range(256)) * 1000)
 os.link(source / 'binary', source / 'hardlink')
 os.symlink('missing', source / 'dangling')
@@ -66,53 +67,91 @@ def restore(snapshot, expected, label):
     assert (restored / 'binary').stat().st_ino == (restored / 'hardlink').stat().st_ino
 
 
-fault_errors = []
-def interrupt():
-    try:
-        time.sleep(2)
-        subprocess.run(['docker', 'pause', container], check=True, stdout=subprocess.DEVNULL)
-        time.sleep(3)
-        subprocess.run(['docker', 'unpause', container], check=True, stdout=subprocess.DEVNULL)
-        time.sleep(2)
-        subprocess.run(['docker', 'network', 'disconnect', 'bridge', container], check=True)
+def faulted(phase, action, command):
+    identifier = work.name + '-' + phase + '-' + action
+    plan = fault_dir / 'plan.json'
+    temp = fault_dir / 'plan.tmp'
+    temp.write_text(json.dumps({'id': identifier, 'phase': phase}))
+    temp.replace(plan)
+    errors = []
+
+    def interrupt():
         try:
-            time.sleep(5)
-        finally:
-            subprocess.run(['docker', 'network', 'connect', 'bridge', container], check=True)
-        time.sleep(2)
-        subprocess.run(['docker', 'kill', '--signal', 'KILL', container], check=True, stdout=subprocess.DEVNULL)
-        subprocess.run(['docker', 'start', container], check=True, stdout=subprocess.DEVNULL)
-    except BaseException as error:
-        fault_errors.append(error)
+            marker = fault_dir / ('reached-' + identifier + '.json')
+            deadline = time.monotonic() + 180
+            while not marker.exists():
+                assert time.monotonic() < deadline, 'Target phase was never reached: ' + phase
+                time.sleep(.02)
+            record = json.loads(marker.read_text())
+            assert record['leftAt'] is None, 'Operation left target phase before fault'
+            fault_at = int(time.time() * 1000)
+            if action == 'hold':
+                # Keep the bulk request active while a real restic refresh cycle runs.
+                lock_log = fault_dir / 'lock-writes.jsonl'
+                deadline = time.monotonic() + 420
+                while True:
+                    records = [json.loads(line) for line in lock_log.read_text().splitlines()] if lock_log.exists() else []
+                    if any(item['at'] > fault_at for item in records):
+                        break
+                    assert time.monotonic() < deadline, 'No successful lock refresh while bulk commit was held'
+                    assert json.loads(marker.read_text())['leftAt'] is None
+                    time.sleep(.2)
+            elif action == 'pause':
+                subprocess.run(['docker', 'pause', container], check=True, stdout=subprocess.DEVNULL)
+                try:
+                    assert json.loads(marker.read_text())['leftAt'] is None
+                    time.sleep(2)
+                finally:
+                    subprocess.run(['docker', 'unpause', container], check=True, stdout=subprocess.DEVNULL)
+            elif action == 'network':
+                subprocess.run(['docker', 'network', 'disconnect', 'bridge', container], check=True)
+                try:
+                    (fault_dir / ('release-' + identifier)).touch()
+                    time.sleep(3)
+                finally:
+                    subprocess.run(['docker', 'network', 'connect', 'bridge', container], check=True)
+            else:
+                subprocess.run(['docker', 'kill', '--signal', 'KILL', container], check=True, stdout=subprocess.DEVNULL)
+                subprocess.run(['docker', 'start', container], check=True, stdout=subprocess.DEVNULL)
+            record = json.loads(marker.read_text())
+            assert record['leftAt'] is None or record['leftAt'] >= fault_at, 'Fault missed the active operation'
+            (fault_dir / ('release-' + identifier)).touch()
+            print('FAULT CONFIRMED: ' + phase + ' / ' + action, flush=True)
+        except BaseException as error:
+            errors.append(error)
+            (fault_dir / ('release-' + identifier)).touch()
+
+    thread = threading.Thread(target=interrupt)
+    thread.start()
+    try:
+        command()
+    finally:
+        thread.join()
+    assert not errors, errors
 
 
 print('Live stress artifacts: ' + str(work), flush=True)
 if os.environ.get('SKIP_INIT') != '1':
     run('init')
-expected_first = manifest(source)
-baseline_tag = work.name + '-baseline'
-faulted_tag = work.name + '-faulted'
-run('backup', str(source), '--tag', baseline_tag)
-first = json.loads(run('snapshots', '--json', '--tag', baseline_tag).stdout)[0]['id']
-restore(first, expected_first, 'baseline-restore')
-print('PASS: live baseline backup and verified edge-case restore', flush=True)
-(source / 'random').write_bytes(os.urandom(24 * 1024 * 1024))
-(source / 'empty').unlink()
-(source / 'new-empty').touch()
-expected_second = manifest(source)
-fault = threading.Thread(target=interrupt)
-fault.start()
-try:
-    run('backup', str(source), '--tag', faulted_tag)
-finally:
-    fault.join()
-assert not fault_errors, fault_errors
-second = json.loads(run('snapshots', '--json', '--tag', faulted_tag).stdout)[-1]['id']
+snapshots = []
+cases = [('before-commit', 'network'), ('after-commit', 'kill')]
+if os.environ.get('LOCK_REFRESH_SOAK') == '1':
+    cases.append(('before-commit', 'hold'))
+for phase, action in cases:
+    (source / 'random').write_bytes(os.urandom(12 * 1024 * 1024))
+    tag = work.name + '-' + phase + '-' + action
+    expected = manifest(source)
+    faulted(phase, action, lambda: run('backup', str(source), '--tag', tag))
+    snapshot = json.loads(run('snapshots', '--json', '--tag', tag).stdout)[-1]['id']
+    snapshots.append((snapshot, expected))
+    run('check', '--read-data')
+    restore(snapshot, expected, phase + '-restore')
+    print('PASS: phase-synchronized backup, full check and cold-cache restore: ' + phase, flush=True)
+
+first, original = snapshots[0]
+second, current = snapshots[-1]
+faulted('after-trash', 'kill', lambda: run('forget', first, '--prune'))
 run('check', '--read-data')
-restore(second, expected_second, 'faulted-restore')
-restore(first, expected_first, 'historical-restore')
-print('PASS: live backup survived pause, network removal and SIGKILL; full check and both cold-cache restores matched', flush=True)
-run('forget', first, '--prune')
-run('check', '--read-data')
-restore(second, expected_second, 'post-prune-restore')
-print('PASS: live prune, full check and post-prune restore', flush=True)
+restore(second, current, 'post-prune-restore')
+print('PASS: acknowledged trash interrupted before response; retained snapshot checks and restores', flush=True)
+(work / 'trashed-snapshot').write_text(first)

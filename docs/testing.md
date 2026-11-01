@@ -2,9 +2,21 @@
 
 Tests run on Linux x86-64 on 2026-11-01 with Bun 1.4.4, restic **0.19.1** (Go 1.26.4), and the pinned Proton SDK `b68d64bd9f9c1f24be521c8b423c26f5dca1c681`. ARM64 execution uses QEMU; it is not a physical ARM board test.
 
+## Version 0.3 review fixes
+
+The current suite contains 37 tests. The review regressions exercise the actual pinned SDK's ID enumeration, metadata-loading and public transformation code. The simulated API enumerates two children but omits one metadata result: the deprecated convenience iterator demonstrably returns one object, while the adapter rejects data, snapshot and lock listings and cannot install a partial lookup index.
+
+Additional tests cover five blocked bulk requests with eight successful lock write/list/delete cycles; normal new uploads downloading zero bytes; optional audit failure on corrupt remote data; metadata deadlines canceling all admitted iterators and allowing new work only after they stop; the real SDK mapper draining outstanding decrypt work before a canceled operation releases admission; transport cancellation for SDK metadata methods without signal arguments; canceled queue jobs never running or overtaking an active job; and a failed refresh-token save being retried before the SDK's changed-token shortcut, followed by restart loading the rotated token. The persistence test also makes error logging fail and checks the retry obligation survives.
+
+Deletion tests now assert that the exact object remains in Trash across restart and lost acknowledgments, unrelated objects survive, and no permanent-delete call occurs. Permanent deletion and the local deletion journal have been removed. The real-restic proxy/fault campaign passed with strict listings, cancellation and the new upload acknowledgment boundary.
+
+Live tests now use a separate instrumented test image with checkpoints at actual API commit and trash phases. The production image has no checkpoint code. Before acting, the controller requires a recorded held operation; a missed or never-reached phase fails the test. Phase-synchronized campaigns confirmed network removal immediately before a bulk commit, SIGKILL after the commit HTTP response but before the SDK consumed it, and SIGKILL after trashing a snapshot but before acknowledgment. Full checks, cold-cache manifest comparisons and retained-snapshot restoration passed after each relevant phase.
+
+A separate live campaign held a bulk commit for 296 seconds while a real restic lock refresh successfully completed. Its subsequent full check, restore and trash-acknowledgment interruption also passed. The removed snapshot was independently found in Proton Trash. Fresh-state recovery then used a new login/session, external key, REST token and empty state volume; it discovered the repository through Proton, checked all 17 active packs across six snapshots, and restored the latest 44 MiB logical fixture with byte/mode/link-manifest and hardlink checks. No previous adapter session, client UID, key, SQLite cache, lookup index or pack cache was copied. These tests do not establish long-term operation or hundreds-of-GB scale.
+
 ## Version 0.2 validation: headless login and production performance fixes
 
-The current suite has 28 tests. In addition to the original fault/recovery cases below, it verifies:
+The earlier version 0.2 suite had 28 tests. In addition to the original fault/recovery cases below, it verifies:
 
 - A 10,000-object directory: 1,000 successful point lookups and 100 misses require one complete directory traversal. Explicit REST listings still traverse completely and fail on broken pages.
 - Drive node events update lookups without rescanning; refresh events invalidate and rebuild. Concurrent identical POSTs publish one remote object and return four valid acknowledgments.
@@ -31,11 +43,11 @@ The original unit/integration coverage includes:
 
 - HTTP v1/v2, authentication, exact lengths, range boundaries, zero-length objects and unknown REST versions.
 - Truncated/slow incoming bodies, canceled outgoing streams, saturated admission queues, an expired transfer deadline and unavailable spool storage. Healthy requests must work afterward.
-- Upload failures, lost commit acknowledgments, duplicate writes and immutable config. Newly uploaded objects must pass a verified read-back before acknowledgment.
+- Upload failures, lost commit acknowledgments, duplicate writes and immutable config. New objects use SDK integrity checks and confirmed commits; optional read-back audits and verified immutable retries are covered.
 - Truncated downloads, corrupt bytes, invalid signatures, broken listing pages and undecryptable entries. Failed reads cannot emit a successful partial body or range.
 - Newer/malformed required SDK versions and unsupported feature masks, including masks larger than 32 bits.
 - Fifty concurrent atomic session saves, mode-0600 persistence, survival of a failed session-file write, reload and rejection of malformed credentials; concurrent expired-token requests trigger one account-SDK refresh and persist the new access and refresh tokens to disk.
-- Crash recovery after trash, before permanent deletion, and after a lost permanent-deletion acknowledgment. A fresh provider/store reconstructs state from disk, retries are idempotent, and an unrelated node survives.
+- Crash/lost-acknowledgment recovery for trash-only removal. A fresh provider/store reads on-disk provider state, retries are idempotent, and the object remains recoverable.
 - Sixty-four cycles of mixed writes, ranges and deletes with injected lost acknowledgments.
 
 The initial campaign ran the real-restic stress test five times with independently generated random data; the version 0.2 campaign above adds runs with indexing and caching enabled. The final expanded run covers:
@@ -63,19 +75,28 @@ The initial live fault sequence found an upstream PID-lock problem when Docker r
 
 The final local OCI manifest contains both linux/amd64 and linux/arm64. Compose startup with `--wait`, its healthcheck, restart/session reuse and refusal of a concurrent container were also verified. Both architecture images build and execute; neither contains restic. The arm64 container has also created a live Proton repository, backed up three files (1 MiB logical), passed a full data check, and restored and compared those files under QEMU.
 
-Run the live fault sequence only against a dedicated disposable repository/container:
+Run live tests only against a dedicated disposable repository. Build the separate test image:
+
+```sh
+docker build -t restic-proton-drive:review .
+docker build -f docker/Fault.Dockerfile -t restic-proton-drive:fault-review .
+```
+
+Start that image on Docker's `bridge` network with the usual private state volume/key, plus a writable host directory bind-mounted at `/fault` and `FAULT_DIR=/fault`. It must already be authenticated/configured. The checkpoint code is test-only and must not be used for backups.
 
 ```sh
 LIVE_DISPOSABLE=1 \
-STRESS_CONTAINER=your-disposable-container \
+STRESS_CONTAINER=your-disposable-fault-container \
+FAULT_DIR=/host/path/to/mounted-fault-directory \
 REST_TOKEN_FILE=/private/token \
 RESTIC_PASSWORD_FILE=/private/restic-password \
 RESTIC_REPOSITORY=rest:http://127.0.0.1:18000/ \
 RESTIC_BIN=/path/to/restic \
+LOCK_REFRESH_SOAK=1 \
 python3 scripts/live-container-stress.py
 ```
 
-The container must be on Docker's `bridge` network and already authenticated/configured. It is paused, disconnected, killed and restarted by name. Add `SKIP_INIT=1` to use an initialized test repository. Each run tags its snapshots uniquely and prunes only its baseline snapshot. `scripts/fault-test.py` supplies additional live object-level upload/disconnect/retry/range/delete checks.
+The named container is disconnected/killed/restarted. Add `SKIP_INIT=1` for an initialized test repository. `LOCK_REFRESH_SOAK=1` adds a held bulk commit and waits for a subsequent successful lock write; restic 0.19.1's refresh interval is five minutes. Each run uses unique snapshot tags. A test fails if the targeted checkpoint is not reached or was already released before the fault. Commit/trash response checkpoints additionally require successful Proton API result codes, not only HTTP 200. Earlier sleep-based campaigns verified recovery after disruptions but did not prove which operation was active; they are not evidence of commit-phase coverage.
 
 Earlier independent recovery validation downloaded the repository with the official CLI's unmodified filesystem-download implementation, converted the flat pack directory to local restic shards, and passed plain-restic full checking and restoration without the adapter or cache. See [operations.md](operations.md).
 

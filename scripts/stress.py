@@ -256,7 +256,7 @@ try:
     # Corrupt a committed remote object on disk: the server must return a
     # failed read, never serve unverified bytes, on a full read, regardless of cached partial reads.
     nodes = json.loads((provider / 'remote/nodes.json').read_text())
-    pack = next(n for n in nodes.values() if n['name'].get('ok') and len(n['name']['value']) == 64
+    pack = next(n for n in nodes.values() if not n.get('trashTime') and n['name'].get('ok') and len(n['name']['value']) == 64
                 and n.get('activeRevision', {}).get('claimedSize', 0) > 1000000)
     path = provider / 'remote' / pack['uid']
     original = path.read_bytes()

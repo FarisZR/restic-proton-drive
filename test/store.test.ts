@@ -17,7 +17,7 @@ function fake() {
     const sdk = {
         getNode: async (uid: string) => nodes.find(n => n.uid === uid),
         async *iterateNodes(ids: string[]) { for (const uid of ids) yield nodes.find(n => n.uid === uid) || { missingUid: uid }; },
-        async *iterateFolderChildren(uid: string) { yield* nodes.filter(n => n.parentUid === uid && n.uid !== 'root' && !n.trashTime); },
+        async *iterateFolderChildrenNodeUids(uid: string) { yield* nodes.filter(n => n.parentUid === uid && n.uid !== 'root' && !n.trashTime).map(n => n.uid); },
         async *trashNodes(ids: string[]) {
             for (const uid of ids) { calls.push(`trash:${uid}`); nodes.find(n => n.uid === uid).trashTime = new Date(); yield { uid, ok: true }; }
         },
@@ -39,7 +39,7 @@ test('duplicate listings fail; failed uploads never delete existing objects', as
     const dir = await mkdtemp(join(tmpdir(), 'store-test-'));
     try {
         const f = fake();
-        const store = new DriveStore(f.sdk, 'root', dir);
+        const store = new DriveStore(f.sdk, 'root');
         await store.open();
         const path = join(dir, 'input'); await Bun.write(path, 'hello');
         const id = createHash('sha256').update('hello').digest('hex');
@@ -50,20 +50,18 @@ test('duplicate listings fail; failed uploads never delete existing objects', as
         await expect(store.list('data')).rejects.toThrow('Duplicate');
     } finally { await rm(dir, { recursive: true, force: true }); }
 });
-test('interrupted permanent deletion recovers on restart using exact UID', async () => {
+test('trash-only removal is idempotent and leaves the object recoverable', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'store-test-'));
     try {
         const f = fake(); const id = 'a'.repeat(64);
         f.nodes.push(node('victim', id, 'file', 'data'), node('unrelated', 'personal', 'file', 'other'));
-        const store = new DriveStore(f.sdk, 'root', dir); await store.open();
-        f.fail(true);
-        await expect(store.remove('data', id)).rejects.toThrow('offline');
+        const store = new DriveStore(f.sdk, 'root'); await store.open();
+        await store.remove('data', id);
         expect(f.calls).toEqual(['trash:victim']);
-        f.fail(false);
-        await new DriveStore(f.sdk, 'root', dir).open();
-        expect(f.calls).toEqual(['trash:victim', 'delete:victim']);
+        const recovered = new DriveStore(f.sdk, 'root'); await recovered.open();
+        expect(f.nodes.find(n => n.uid === 'victim')?.trashTime).toBeDefined();
         expect(f.nodes.some(n => n.uid === 'unrelated')).toBe(true);
-        await store.remove('data', id); // retry after lost acknowledgement
-        expect(f.calls.length).toBe(2);
+        await recovered.remove('data', id);
+        expect(f.calls).toEqual(['trash:victim']);
     } finally { await rm(dir, { recursive: true, force: true }); }
 });

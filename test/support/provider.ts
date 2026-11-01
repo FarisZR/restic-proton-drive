@@ -7,7 +7,7 @@ import { atomicWrite } from '../../src/session';
 
 export type Faults = { delay?: number; upload?: number; download?: number; listing?: number;
     lostAck?: number; corruptUpload?: number; corruptRead?: number; truncateRead?: number;
-    signature?: number; trash?: number; permanent?: number; deleteAck?: number; size?: number; listingEntry?: number };
+    signature?: number; trash?: number; permanent?: number; deleteAck?: number; size?: number; listingEntry?: number; missingMetadata?: number; omitMetadata?: number };
 export class Provider {
     nodes: Record<string, NodeEntity> = {};
     faults: Faults = {};
@@ -39,14 +39,22 @@ export class Provider {
         if (!node) throw new Error('Node not found');
         return structuredClone(node);
     }
-    async *iterateNodes(ids: string[]) { for (const uid of ids) yield this.nodes[uid] ? await this.getNode(uid) : { missingUid: uid }; }
-    async *iterateFolderChildren(parentUid: string) {
+    async *iterateNodes(ids: string[], signal?: AbortSignal) {
+        for (const uid of ids) {
+            signal?.throwIfAborted();
+            if (this.hit('omitMetadata')) continue;
+            if (this.hit('missingMetadata')) { yield { missingUid: uid }; continue; }
+            const value = this.nodes[uid] ? await this.getNode(uid) : { missingUid: uid };
+            if ('name' in value && this.hit('listingEntry')) value.name = { ok: false, error: new Error('decryption failed') };
+            yield value;
+        }
+    }
+    async *iterateFolderChildrenNodeUids(parentUid: string, _options?: unknown, signal?: AbortSignal) {
         this.calls.scans = (this.calls.scans || 0) + 1;
         for (const node of Object.values(this.nodes).filter(n => n.parentUid === parentUid && !n.trashTime)) {
+            signal?.throwIfAborted();
             if (this.hit('listing')) throw new Error('503: interrupted listing page');
-            const value = structuredClone(node);
-            if (this.hit('listingEntry')) value.name = { ok: false, error: new Error('decryption failed') };
-            yield value;
+            yield node.uid;
         }
     }
     async createFolder(parent: string, name: string) {
@@ -88,8 +96,9 @@ export class Provider {
             finally { writer.releaseLock(); }
         } }) };
     }
-    async *trashNodes(ids: string[]) {
+    async *trashNodes(ids: string[], signal?: AbortSignal) {
         for (const uid of ids) {
+            signal?.throwIfAborted();
             this.nodes[uid].trashTime = new Date(); await this.save();
             if (this.hit('trash')) throw new Error('Disconnected after trash');
             yield { uid, ok: true };

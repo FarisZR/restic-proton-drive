@@ -16,7 +16,7 @@ const authorization = `Basic ${Buffer.from(`backup:${token}`).toString('base64')
 async function fixture(capacity = 256 * 1024) {
     const dir = await mkdtemp(join(tmpdir(), 'drive-index-cache-'));
     const provider = new Provider(join(dir, 'remote')); await provider.open();
-    const store = new DriveStore(provider.sdk, 'root', dir); await store.open(); await store.create();
+    const store = new DriveStore(provider.sdk, 'root'); await store.open(); await store.create();
     const spool = join(dir, 'spool'); await mkdir(spool);
     const cache = new PackCache(join(dir, 'packs'), capacity); await cache.open();
     const server = httpServer(handler(store, token, spool, cache));
@@ -41,7 +41,7 @@ test('10,000-object lookup index scans once; complete listings remain authoritat
                 type: 'file', name: { ok: true, value: id }, activeRevision: { uid: 'rev-' + n, claimedSize: 16 * 1024 * 1024 } } as any;
         }
         // A fresh store models a restart with no local object index.
-        const store = new DriveStore(f.provider.sdk, 'root', f.dir); await store.open();
+        const store = new DriveStore(f.provider.sdk, 'root'); await store.open();
         const scans = f.provider.calls.scans;
         for (let n = 0; n < 1000; n++) {
             expect((await store.find('data', n.toString(16).padStart(64, '0')))?.uid).toBe('pack-' + n);

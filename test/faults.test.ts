@@ -12,10 +12,10 @@ import { httpServer } from '../src/http';
 const token = 'test-token-'.repeat(4);
 const authorization = `Basic ${Buffer.from(`backup:${token}`).toString('base64')}`;
 const hash = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
-async function fixture(timeoutMs?: number) {
+async function fixture(timeoutMs?: number, auditUploads = false) {
     const dir = await mkdtemp(join(tmpdir(), 'drive-faults-'));
     const provider = new Provider(join(dir, 'remote')); await provider.open();
-    const store = new DriveStore(provider.sdk, 'root', dir); await store.open(); await store.create();
+    const store = new DriveStore(provider.sdk, 'root', auditUploads); await store.open(); await store.create();
     const spool = join(dir, 'spool'); await mkdir(spool);
     const server = httpServer(handler(store, token, spool), timeoutMs);
     await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -49,8 +49,8 @@ test('SDK fault matrix: failed reads/listings never return successful partial da
     } finally { await f.close(); }
 });
 
-test('upload failures, lost acknowledgments, read-back corruption and immutable config', async () => {
-    const f = await fixture();
+test('upload failures, lost acknowledgments, optional read-back audit and immutable config', async () => {
+    const f = await fixture(undefined, true);
     try {
         const bytes = new TextEncoder().encode('unique payload'); const id = hash(bytes);
         f.provider.faults = { upload: 1 };
@@ -145,20 +145,23 @@ test('empty objects and zero-length ranges; deadline aborts a stalled upload', a
 });
 
 test('deletion restart matrix preserves unrelated objects across every ambiguous outcome', async () => {
-    for (const fault of ['trash', 'permanent', 'deleteAck'] as const) {
+    for (const fault of ['trash'] as const) {
         const f = await fixture();
         try {
             const bytes = new TextEncoder().encode(`delete-${fault}`); const id = hash(bytes);
             expect((await f.request(`/data/${id}`, 'POST', bytes)).status).toBe(200);
+            const victim = (await f.store.find('data', id))!;
             const unrelated = await f.provider.createFolder('elsewhere', 'personal');
             f.provider.faults = { [fault]: 1 };
             expect((await f.request(`/data/${id}`, 'DELETE')).status).toBe(500);
             // New provider and store, with only on-disk state preserved.
             const reloaded = new Provider(join(f.dir, 'remote')); await reloaded.open();
-            const store = new DriveStore(reloaded.sdk, 'root', f.dir); await store.open();
+            const store = new DriveStore(reloaded.sdk, 'root'); await store.open();
             expect(await store.find('data', id)).toBeUndefined();
             expect((await reloaded.getNode(unrelated.uid)).name).toEqual({ ok: true, value: 'personal' });
-            await store.remove('data', id); // lost HTTP deletion acknowledgment retry
+            await store.remove('data', id); // lost HTTP trash acknowledgment retry
+            expect((await reloaded.getNode(victim.uid)).trashTime).toBeDefined();
+            expect(f.provider.calls.permanent || 0).toBe(0);
         } finally { await f.close(); }
     }
 });

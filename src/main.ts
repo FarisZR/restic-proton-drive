@@ -13,7 +13,7 @@ import { VERSION } from '@protontech/drive-sdk';
 process.umask(0o077);
 const command = process.argv[2];
 const state = process.env.PROTON_DRIVE_CACHE_DIR;
-if (command === 'version') { console.log(`restic-proton-drive 0.2.0; Bun ${Bun.version}; SDK ${VERSION}`); process.exit(0); }
+if (command === 'version') { console.log(`restic-proton-drive 0.3.0; Bun ${Bun.version}; SDK ${VERSION}`); process.exit(0); }
 if (command === 'health') {
     if (!state) throw new Error('PROTON_DRIVE_CACHE_DIR is required');
     const token = (await Bun.file(process.env.REST_TOKEN_FILE || join(state, 'rest-token')).text()).trim();
@@ -61,7 +61,9 @@ try {
     const tokenFile = process.env.REST_TOKEN_FILE || join(app.config.appDir, 'rest-token');
     const token = (await Bun.file(tokenFile).text()).trim();
     if (token.length < 24) throw new Error('Use a random REST token of at least 24 characters');
-    const store = new DriveStore(app.sdk, uid, app.config.appDir);
+    const audit = process.env.AUDIT_UPLOADS || '0';
+    if (!['0', '1'].includes(audit)) throw new Error('AUDIT_UPLOADS must be 0 or 1');
+    const store = new DriveStore(app.sdk, uid, audit === '1');
     app.onEvent(event => store.handleEvent(event));
     await store.open();
     await app.eventsManager.subscribeDriveScope((await app.sdk.getNode(uid)).treeEventScopeId);

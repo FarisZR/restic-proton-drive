@@ -35,7 +35,9 @@ Create and keep a secure copy of your restic password before initializing. It is
 
 Keep `session-key` in this private deployment directory, outside the `drive-state` volume. It encrypts the Proton session; Compose mounts it as a secret. Retain both the key and volume across updates. The server is published only on localhost. For a restic client in another container, join the Compose network and use `rest:http://drive:8000/`.
 
-Use restic's default pack size. The server accepts objects up to 64 MiB and uses a bounded 256 MiB verified-pack cache and up to 512 MiB of temporary transfer files, plus metadata caches. Run one server per repository and manage its files through restic.
+Deleted repository objects go to Proton Trash. Pruning does not permanently erase them or immediately reclaim their quota; manage Trash in Proton when appropriate.
+
+Use restic's default pack size. The server accepts objects up to 64 MiB and uses a bounded 256 MiB verified-pack cache and up to 896 MiB of temporary transfer files, plus metadata caches. Run one server per repository and manage its files through restic.
 
 ## Update and maintain
 

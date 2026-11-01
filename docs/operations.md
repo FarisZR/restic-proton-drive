@@ -21,12 +21,13 @@ Compose uses a private named volume and publishes port 8000 on host loopback. In
 
 | Setting | Default in image | Purpose |
 | --- | --- | --- |
-| `PROTON_DRIVE_CACHE_DIR` | `/state` | Encrypted session, SDK caches, verified packs, repository UID, token and deletion intent |
+| `PROTON_DRIVE_CACHE_DIR` | `/state` | Encrypted session, SDK caches, verified packs, repository UID, token |
 | `REPOSITORY_UID` | `/state/repository.uid` contents | Select an existing dedicated Drive folder |
 | `REST_TOKEN_FILE` | `/state/rest-token` | Basic authentication password (username `backup`) |
 | `HOST` | `0.0.0.0` | Listener address; source execution defaults to loopback |
 | `PORT` | `8000` | Listener port |
 | `SESSION_KEY_FILE` | `/run/secrets/session-key` | External file containing a 32-byte key encoded as 64 hexadecimal digits |
+| `AUDIT_UPLOADS` | `0` | Set `1` to download and verify every new committed upload; normal uploads trust SDK integrity checks and confirmed commit |
 | `PACK_CACHE_MIB` | `256` | Verified pack cache capacity; `0` disables caching |
 | `PROTON_DRIVE_CREDENTIALS_STORE` | `unsafe_file` | Upstream setting name; this application encrypts that file. Source installs can use `pass` or OS keychain |
 
@@ -38,35 +39,47 @@ Run `docker compose run --rm drive login --headless` over SSH. Open its URL in a
 
 ## Session encryption
 
-Sessions, including access/refresh tokens and the Drive user-key password, are stored using authenticated AES-256-GCM encryption. The master key is mounted separately from the state volume as a Docker secret. Missing/incorrect keys, damaged ciphertext and unsupported envelope versions fail closed. Refreshed sessions are encrypted and atomically persisted with fsync.
+Sessions, including access/refresh tokens and the Drive user-key password, are stored using authenticated AES-256-GCM encryption. The master key is mounted separately from the state volume as a Docker secret. Missing/incorrect keys, damaged ciphertext and unsupported envelope versions fail closed. Refreshed sessions are encrypted and atomically persisted with fsync. Failed saves retain the new credentials in memory and retry in the background and before subsequent API requests/refresh shortcuts. A persistent storage failure is reported; new tokens cannot survive process loss until storage becomes writable and persistence succeeds.
 
 The deployment directory is mode 0700 to restrict host access. The key file is mode 0644 so the non-root container can read the bind-mounted secret even when the host login UID differs from 1000. Keep that directory private. Compose mounts only the key file read-only. Other secret-management systems can mount their own key and set `SESSION_KEY_FILE` instead.
 
 Keep the key outside state-volume backups. Encryption protects a copied state volume; it does not protect a compromised running host/container with access to the mounted key. The REST authentication token remains a protected mode-0600 file. Restic's encryption password is separate and never stored by this server.
 
-If the key is lost, restore it or remove only `auth-session.json` and the two SDK cache SQLite files (including WAL/SHM files) while the server is stopped, then authenticate again with a new key. Keep `repository.uid`, `rest-token`, and deletion journals. Independent recovery of the repository still needs only Proton authentication and the restic repository password.
+If the key is lost, restore it or remove only `auth-session.json` and the two SDK cache SQLite files (including WAL/SHM files) while the server is stopped, then authenticate again with a new key. Keep `repository.uid`, `rest-token`, and the repository files. Independent recovery of the repository still needs only Proton authentication and the restic repository password.
 
 `create` makes a dedicated repository folder, saves its UID, and generates the REST token. It refuses to replace an already configured repository. It does not generate or retain a restic password. If supplying `REPOSITORY_UID` manually, supply `REST_TOKEN_FILE` too.
 
-The Docker healthcheck reports whether authenticated HTTP requests can be processed; it bypasses transfer admission and storage work. It does not certify that Proton is reachable or that a backup is restorable. Monitor restic command exit codes and schedule full content checks and periodic restores. HTTP operations have a 30-minute deadline; disconnected clients abort the associated SDK transfer. A failed transfer must be retried by the client. The SDK applies its own network retry/backoff policy.
+The Docker healthcheck reports whether authenticated HTTP requests can be processed; it bypasses transfer admission and storage work. It does not certify that Proton is reachable or that a backup is restorable. Monitor restic command exit codes and schedule full content checks and periodic restores. HTTP operations have a 30-minute deadline. Cancellation reaches ID enumeration, transfers and their HTTP transport, including metadata methods without signal parameters. Metadata iteration drains outstanding SDK decrypt jobs before completing; the pinned SDK’s signaled mapper would abandon those jobs instead. Canceled queued mutations do not execute. Admission slots remain held until underlying work stops; uninterruptible SDK/cache or disk work can still delay cleanup. A failed transfer must be retried by the client. The SDK applies its own network retry/backoff policy.
 
 ## Updates and compatibility
 
 The SDK, Bun and dependencies are pinned. Proton requirement headers that demand a newer SDK or unsupported Drive features fail the operation. Unsupported REST protocol versions return 406. New restic releases should pass the test suite before changing the supported version. Both REST v1/v2 are supported; repository config remains immutable, so in-place repository-format migration is not supported.
 
-Use a single adapter process and persistent volume per repository, and avoid modifying the repository through other Drive clients. Four transfers can run concurrently; excess requests receive 503 with retry guidance. Mutations are serialized inside the store to protect immutable objects and the deletion journal. Multiple restic clients can use the server; restic's own locks coordinate backup and maintenance. Run retention and checks according to your operational schedule.
+Use a single adapter process and persistent volume per repository, and avoid modifying the repository through other Drive clients. Five bulk transfers (matching restic’s default REST connection count) and two lock requests have separate admission limits. Lock writes/deletes use their own mutation queue, so bulk upload/verification cannot block lock refresh. Excess requests in a lane receive 503 with retry guidance. Multiple restic clients can use the server; restic's own locks coordinate backup and maintenance.
 
-Keep pending deletion journals. Deletion first records an exact UID durably, then trashes and permanently deletes that node. Restart finishes any pending deletion. Losing the journal during a deletion can leave an orphan in Trash. Never empty the whole account's Trash as a repair shortcut. A moved deletion target requires manual review.
+## Deletion and storage usage
+
+Individual DELETE moves the exact repository object to Proton Trash. The server never permanently deletes committed objects or empties Trash. Retrying after a lost acknowledgment is safe: already-trashed objects are absent from the active directory. No local deletion journal is needed. The SDK can clean up its own unpublished upload drafts.
+
+The REST credential still permits trashing repository objects, including snapshots/config; this is not append-only storage. A compromised backup client can therefore disrupt the active repository, but cannot use this server to purge its Trash. Recovery requires access to Proton. Restic encryption does not prevent authorized deletion.
+
+Pruning now removes objects from the active repository but leaves them recoverable in Trash. Their storage can continue counting against quota. Clear unwanted Trash in Proton separately when appropriate; this service deliberately does not provide that operation.
+
+## Upload acknowledgments
+
+Incoming content-addressed objects must match their SHA-256 names. The SDK receives the exact byte count and SHA-1, verifies upload/block integrity and confirms the committed revision, including its own ambiguous-commit reconciliation. The adapter checks the returned revision metadata before acknowledging success. Normal uploads do not download their content again.
+
+Set `AUDIT_UPLOADS=1` to add a full verified read-back of every new upload. Retrying a previously committed immutable object always verifies its actual existing content before acknowledging it, including config. Uncertain failures invalidate the local lookup index; retries reconcile against a complete listing and never overwrite an earlier object. Continue scheduling `restic check --read-data` (or rotating subsets) and restores to verify stored data over time.
 
 ## Lookup index and verified pack cache
 
-Point lookups use an in-memory name-to-UID index built from one complete SDK traversal per directory. Successful uploads and deletions update it immediately. Drive events update changed nodes, invalidate it on refresh/errors, and keep SDK caches synchronized. Restart rebuilds it rather than trusting a persisted object catalog. Every REST listing still performs a complete SDK traversal and fails if any page/metadata entry fails; pruning never relies solely on the point-lookup index.
+Point lookups use an in-memory name-to-UID index built from one complete SDK traversal per directory. Successful uploads and deletions update it immediately. Drive events update changed nodes, invalidate it on refresh/errors, and keep SDK caches synchronized. Restart rebuilds it rather than trusting a persisted object catalog. Every REST listing explicitly enumerates child IDs, loads metadata in batches, and requires exactly one valid result per ID. Missing markers, omitted/duplicate/unexpected results, changed parents and undecryptable entries all fail the listing; pruning never relies solely on the point-lookup index.
 
 Only partial pack reads use the disk cache. Concurrent requests for the same pack share one full, verified download. Entries are content-addressed, checked for length and SHA-256 on every use, evicted by LRU, and pinned while a response streams. A canceled waiter cannot abort another waiter's download. Cache capacity includes in-flight and pinned entries; a full pinned cache returns 503. Packs larger than the configured cache bypass it.
 
-Full GETs, ranges covering the whole object, and upload read-back verification always read Proton. Consequently `restic check --read-data` cannot succeed just because a good local cached copy masks remote damage or loss. Partial reads can reuse the previously verified immutable content. The first partial read still downloads the entire pack to retain full SDK verification. Cache hits save network bandwidth; they still hash local file contents. Restart discards the cache. `PACK_CACHE_MIB=0` restores uncached operation.
+Full GETs, ranges covering the whole object, and optional upload audits always read Proton. Consequently `restic check --read-data` cannot succeed just because a good local cached copy masks remote damage or loss. Partial reads can reuse the previously verified immutable content. The first partial read still downloads the entire pack to retain full SDK verification. Cache hits save network bandwidth; they still hash local file contents. Restart discards the cache. `PACK_CACHE_MIB=0` restores uncached operation.
 
-The default cache is 256 MiB. Four admitted transfers use at most 512 MiB of temporary files in addition to that cache; no full repository mirror is kept. The repository uses the standard Restic REST layout.
+The default cache is 256 MiB. Five bulk and two reserved lock requests use at most 896 MiB of temporary files in addition to that cache; no full repository mirror is kept. The repository uses the standard Restic REST layout.
 
 ## Independent recovery
 

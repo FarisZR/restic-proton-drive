@@ -2,6 +2,7 @@ import { timingSafeEqual } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { withSignal } from './request-context';
 import type { PackCache } from './pack-cache';
 import { DriveStore, HttpError, MAX, size, types } from './store';
 
@@ -18,15 +19,16 @@ export function range(header: string | null, length: number): [number, number] |
 
 export function handler(store: DriveStore, token: string, spoolDir = tmpdir(), cache?: PackCache) {
     const expected = Buffer.from(`Basic ${Buffer.from(`backup:${token}`).toString('base64')}`);
-    let pending = 0;
-    return async (request: Request): Promise<Response> => {
+    const pending = { bulk: 0, locks: 0 };
+    return (request: Request): Promise<Response> => withSignal(request.signal, async () => {
         const auth = Buffer.from(request.headers.get('authorization') || '');
         if (auth.length !== expected.length || !timingSafeEqual(auth, expected))
             return new Response('Unauthorized', { status: 401, headers: { 'WWW-Authenticate': 'Basic realm="backup"' } });
         const pathName = new URL(request.url).pathname;
         if (pathName === '/health' && request.method === 'GET') return new Response('OK');
-        if (pending >= 4) return new Response('Busy', { status: 503, headers: { 'Retry-After': '2' } });
-        pending++;
+        const lane = /^\/locks(?:\/|$)/.test(pathName) ? 'locks' : 'bulk';
+        if (pending[lane] >= (lane === 'locks' ? 2 : 5)) return new Response('Busy', { status: 503, headers: { 'Retry-After': '2' } });
+        pending[lane]++;
         let dir: string | undefined;
         let streaming = false;
         let lease: { path: string; release: () => Promise<void> } | undefined;
@@ -39,7 +41,7 @@ export function handler(store: DriveStore, token: string, spoolDir = tmpdir(), c
                 throw new HttpError(406, 'Unsupported REST protocol version');
             if (path === '/') {
                 if (request.method === 'POST' && url.search === '?create=true') {
-                    await store.create(); return new Response();
+                    await store.create(request.signal); return new Response();
                 }
                 throw new HttpError(request.method === 'DELETE' ? 403 : 404, 'Repository removal disabled');
             }
@@ -49,13 +51,13 @@ export function handler(store: DriveStore, token: string, spoolDir = tmpdir(), c
             if (!id) {
                 if (request.method !== 'GET' || !path.endsWith('/') || !types.includes(type))
                     throw new HttpError(405, 'Method not allowed');
-                const list = await store.list(type);
+                const list = await store.list(type, request.signal);
                 const v2 = request.headers.get('accept')?.includes('application/vnd.x.restic.rest.v2');
                 return new Response(JSON.stringify(v2 ? list : list.map(x => x.name)), {
                     headers: { 'Content-Type': `application/vnd.x.restic.rest.v${v2 ? 2 : 1}` },
                 });
             }
-            if (request.method === 'DELETE') { await store.remove(type, id); return new Response(); }
+            if (request.method === 'DELETE') { await store.remove(type, id, request.signal); return new Response(); }
             if (!['POST', 'GET', 'HEAD'].includes(request.method)) throw new HttpError(405, 'Method not allowed');
             dir = await mkdtemp(join(spoolDir, 'restic-proton-'));
             const objectPath = join(dir, 'object');
@@ -77,7 +79,7 @@ export function handler(store: DriveStore, token: string, spoolDir = tmpdir(), c
                 await store.put(type, id, objectPath, request.signal);
                 return new Response();
             }
-            const node = await store.find(type, id);
+            const node = await store.find(type, id, request.signal);
             if (!node) throw new HttpError(404, 'Object not found');
             const length = size(node);
             const headers = new Headers({ 'Content-Length': String(length), 'Content-Type': 'application/octet-stream', 'Accept-Ranges': 'bytes' });
@@ -104,7 +106,7 @@ export function handler(store: DriveStore, token: string, spoolDir = tmpdir(), c
                 try { await reader.cancel(); }
                 finally {
                     try { await lease?.release(); await rm(responseDir, { recursive: true, force: true }); }
-                    finally { pending--; }
+                    finally { pending[lane]--; }
                 }
             };
             return new Response(new ReadableStream({
@@ -124,7 +126,7 @@ export function handler(store: DriveStore, token: string, spoolDir = tmpdir(), c
             });
         } finally {
             try { if (!streaming) await lease?.release(); if (dir) await rm(dir, { recursive: true, force: true }); }
-            finally { if (!streaming) { pending--; } }
+            finally { if (!streaming) { pending[lane]--; } }
         }
-    };
+    });
 }

@@ -13,3 +13,6 @@ sdk/**/dist
 
 !docker/
 !docker/**
+!test/
+!test/support/
+!test/support/live-entry.ts
