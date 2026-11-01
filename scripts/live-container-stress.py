@@ -133,6 +133,21 @@ def faulted(phase, action, command):
 print('Live stress artifacts: ' + str(work), flush=True)
 if os.environ.get('SKIP_INIT') != '1':
     run('init')
+if os.environ.get('TRASH_ONLY') == '1':
+    tags = [work.name + '-trash-baseline', work.name + '-trash-retained']
+    run('backup', str(source), '--tag', tags[0])
+    first = json.loads(run('snapshots', '--json', '--tag', tags[0]).stdout)[-1]['id']
+    (source / 'proof').write_text('retained snapshot')
+    expected = manifest(source)
+    run('backup', str(source), '--tag', tags[1])
+    retained = json.loads(run('snapshots', '--json', '--tag', tags[1]).stdout)[-1]['id']
+    faulted('after-trash', 'kill', lambda: run('forget', first, '--prune'))
+    run('check', '--read-data')
+    restore(retained, expected, 'trash-retained-restore')
+    (work / 'trashed-snapshot').write_text(first)
+    print('PASS: API-confirmed trash fault, retained snapshot full check and restore', flush=True)
+    raise SystemExit(0)
+
 snapshots = []
 cases = [('before-commit', 'network'), ('after-commit', 'kill')]
 if os.environ.get('LOCK_REFRESH_SOAK') == '1':

@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { ProtonDriveClient } from '@protontech/drive-sdk';
 import { DriveStore } from '../../src/store';
 import { RequestHTTPClient, requestSignal } from '../../src/request-context';
+import { confirmedMutation } from './fault-response';
 import { atomicWrite } from '../../src/session';
 
 const operation = new AsyncLocalStorage<{ size?: number; type?: string }>();
@@ -48,7 +49,7 @@ RequestHTTPClient.prototype.fetchJson = async function (options) {
     const response = await fetchJson.call(this, options);
     if (response.ok && (commit || trash)) {
         const result = await response.clone().json();
-        const confirmed = result.Code === 1000 && (!trash || result.Responses?.every((item: any) => item.Response?.Code === 1000));
+        const confirmed = confirmedMutation(result, trash ? (options.json as any).LinkIDs : undefined);
         if (confirmed && commit) await checkpoint('after-commit');
         if (confirmed && trash) await checkpoint('after-trash');
     }

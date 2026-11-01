@@ -16,3 +16,5 @@ sdk/**/dist
 !test/
 !test/support/
 !test/support/live-entry.ts
+
+!test/support/fault-response.ts
